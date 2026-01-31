@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -1229,7 +1230,7 @@ async def any_text(message: Message) -> None:
 
 async def main() -> None:
     await init_db()
-    bot = Bot(settings.bot_token, parse_mode="HTML")
+    bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot)
