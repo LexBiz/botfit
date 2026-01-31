@@ -18,9 +18,11 @@ class User(Base):
     telegram_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, default=lambda: dt.datetime.utcnow(), onupdate=lambda: dt.datetime.utcnow()
+        DateTime,
+        default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
+        onupdate=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
     )
 
     profile_complete: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -74,7 +76,7 @@ class Meal(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), index=True)
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
     eaten_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     source: Mapped[str] = mapped_column(String(16), default="text")  # text/photo/voice/manual
@@ -118,7 +120,7 @@ class Plan(Base):
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), index=True)
 
     date: Mapped[dt.date] = mapped_column(Date, index=True)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
 
     calories_target: Mapped[int | None] = mapped_column(Integer, nullable=True)
     plan_json: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -142,9 +144,11 @@ class Food(Base):
     # nutriments per 100g (JSON)
     nutriments_json: Mapped[str] = mapped_column(Text)
 
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
     updated_at: Mapped[dt.datetime] = mapped_column(
-        DateTime, default=lambda: dt.datetime.utcnow(), onupdate=lambda: dt.datetime.utcnow()
+        DateTime,
+        default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
+        onupdate=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
     )
 
 

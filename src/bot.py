@@ -49,6 +49,10 @@ from src.tg_files import download_telegram_file
 
 router = Router()
 
+def _utcnow_naive() -> dt.datetime:
+    # avoid deprecated datetime.utcnow(); store as naive UTC for SQLite
+    return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
 
 ONBOARDING_QUESTIONS = {
     1: "Возраст? (число)",
@@ -1056,7 +1060,7 @@ async def cmd_week(message: Message) -> None:
             await message.answer("Сначала заполним профиль: /start")
             return
 
-        end = dt.datetime.utcnow()
+        end = _utcnow_naive()
         start = end - dt.timedelta(days=7)
         meals = await meal_repo.meals_between(user.id, start, end)
         diary = []
