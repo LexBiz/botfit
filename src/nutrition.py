@@ -17,6 +17,15 @@ class Targets:
     carbs_g: int
 
 
+@dataclass(frozen=True)
+class CalcMeta:
+    bmr_kcal: int
+    tdee_kcal: int
+    goal: Goal
+    deficit_pct: float  # negative for surplus
+    deficit_kcal: int   # negative for surplus
+
+
 def _activity_multiplier(level: ActivityLevel) -> float:
     # simplified multipliers
     return {
@@ -36,14 +45,34 @@ def tdee(bmr: float, activity: ActivityLevel) -> float:
     return bmr * _activity_multiplier(activity)
 
 
-def calorie_target_from_goal(tdee_kcal: float, goal: Goal) -> int:
+def default_deficit_pct(goal: Goal) -> float:
+    # positive = deficit, negative = surplus
     if goal == "loss":
-        return int(round(tdee_kcal * 0.85))  # ~15% deficit
-    if goal == "gain":
-        return int(round(tdee_kcal * 1.10))  # ~10% surplus
+        return 0.15
     if goal == "recomp":
-        return int(round(tdee_kcal * 0.95))  # small deficit to recomposition
-    return int(round(tdee_kcal))
+        return 0.10
+    if goal == "gain":
+        return -0.10
+    return 0.0
+
+
+def clamp_deficit_pct(goal: Goal, pct: float) -> float:
+    # keep it realistic + safe
+    if goal == "gain":
+        return max(min(pct, -0.05), -0.15)
+    if goal == "maintain":
+        return 0.0
+    if goal == "recomp":
+        return max(min(pct, 0.15), 0.05)
+    # loss
+    return max(min(pct, 0.30), 0.10)
+
+
+def calorie_target_from_tdee(tdee_kcal: float, *, goal: Goal, deficit_pct: float | None = None) -> tuple[int, float]:
+    pct = default_deficit_pct(goal) if deficit_pct is None else deficit_pct
+    pct = clamp_deficit_pct(goal, float(pct))
+    cal = int(round(tdee_kcal * (1.0 - pct)))
+    return cal, pct
 
 
 def macros_for_targets(calories: int, weight_kg: float, goal: Goal) -> Targets:
@@ -69,8 +98,38 @@ def compute_targets(
     activity: ActivityLevel,
     goal: Goal,
 ) -> Targets:
+    t, _ = compute_targets_with_meta(
+        sex=sex,
+        age=age,
+        height_cm=height_cm,
+        weight_kg=weight_kg,
+        activity=activity,
+        goal=goal,
+        deficit_pct=None,
+    )
+    return t
+
+
+def compute_targets_with_meta(
+    *,
+    sex: Sex,
+    age: int,
+    height_cm: float,
+    weight_kg: float,
+    activity: ActivityLevel,
+    goal: Goal,
+    deficit_pct: float | None,
+) -> tuple[Targets, CalcMeta]:
     b = bmr_mifflin_st_jeor(sex=sex, age=age, height_cm=height_cm, weight_kg=weight_kg)
     td = tdee(b, activity=activity)
-    cal = calorie_target_from_goal(td, goal=goal)
-    return macros_for_targets(cal, weight_kg=weight_kg, goal=goal)
+    cal, pct = calorie_target_from_tdee(td, goal=goal, deficit_pct=deficit_pct)
+    targets = macros_for_targets(cal, weight_kg=weight_kg, goal=goal)
+    meta = CalcMeta(
+        bmr_kcal=int(round(b)),
+        tdee_kcal=int(round(td)),
+        goal=goal,
+        deficit_pct=float(pct),
+        deficit_kcal=int(round(int(round(td)) - cal)),
+    )
+    return targets, meta
 

@@ -14,7 +14,9 @@ from src.config import settings
 from src.db import SessionLocal
 from src.init_db import init_db
 from src.jsonutil import dumps, loads
-from src.nutrition import compute_targets
+from aiogram.types import ReplyKeyboardRemove
+
+from src.nutrition import compute_targets, compute_targets_with_meta
 from src.audio import ogg_opus_to_wav_bytes
 from src.openai_client import text_json, transcribe_audio, vision_json
 from src.prompts import (
@@ -39,11 +41,12 @@ from src.keyboards import (
     BTN_RECIPE,
     BTN_WEEK,
     BTN_WEIGHT,
+    goal_tempo_kb,
     main_menu_kb,
 )
 from src.render import recipe_table
 from src.recipe_calc import compute_totals, parse_ingredients_block
-from src.repositories import FoodRepo, MealRepo, PlanRepo, StatRepo, UserRepo
+from src.repositories import FoodRepo, MealRepo, PlanRepo, PreferenceRepo, StatRepo, UserRepo
 from src.tg_files import download_telegram_file
 
 
@@ -123,6 +126,46 @@ def _map_goal(s: str) -> str | None:
     return None
 
 
+def _parse_tempo_choice(s: str) -> tuple[str, float] | None:
+    t = _norm_text(s)
+    if "жест" in t or "жёст" in t or "быстр" in t or "🔥" in s:
+        return "hard", 0.25
+    if "станд" in t or "✅" in s:
+        return "standard", 0.15
+    if "мяг" in t or "🟢" in s:
+        return "soft", 0.10
+    if "рекомп" in t or "🧱" in s:
+        return "recomp", 0.10
+    if "поддерж" in t or "⚖" in s:
+        return "maintain", 0.0
+    if "набор" in t or "📈" in s:
+        return "gain", -0.10
+    return None
+
+
+def _fmt_goal(goal: str) -> str:
+    return {
+        "loss": "похудение",
+        "maintain": "поддержание",
+        "gain": "набор",
+        "recomp": "рекомпозиция",
+    }.get(goal, goal)
+
+
+def _fmt_pct(p: float) -> str:
+    return f"{abs(p)*100:.0f}%"
+
+
+GOAL_TEMPO = {
+    "soft": ("Мягко", 0.10),
+    "standard": ("Стандарт", 0.15),
+    "hard": ("Жёстко", 0.25),
+    "recomp": ("Рекомпозиция", 0.10),
+    "maintain": ("Поддержание", 0.0),
+    "gain": ("Набор", -0.10),
+}
+
+
 async def _start_onboarding(message: Message, user_repo: UserRepo, user: Any) -> None:
     await user_repo.set_dialog(user, state="onboarding", step=1, data={"answers": {}})
     await message.answer(
@@ -156,10 +199,23 @@ async def cmd_start(message: Message) -> None:
 async def cmd_profile(message: Message) -> None:
     async with SessionLocal() as db:
         repo = UserRepo(db)
+        pref_repo = PreferenceRepo(db)
         user = await repo.get_or_create(message.from_user.id, message.from_user.username if message.from_user else None)
         if not user.profile_complete:
             await message.answer("Профиль не заполнен. Напиши /start чтобы пройти анкету.")
             return
+
+        prefs = await pref_repo.get_json(user.id)
+        deficit_pct = prefs.get("deficit_pct")
+        t, meta = compute_targets_with_meta(
+            sex=user.sex,  # type: ignore[arg-type]
+            age=user.age,
+            height_cm=user.height_cm,
+            weight_kg=user.weight_kg,
+            activity=user.activity_level,  # type: ignore[arg-type]
+            goal=user.goal,  # type: ignore[arg-type]
+            deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
+        )
 
         await message.answer(
             "Твой профиль:\n"
@@ -168,9 +224,11 @@ async def cmd_profile(message: Message) -> None:
             f"- Рост: {user.height_cm} см\n"
             f"- Вес: {user.weight_kg} кг\n"
             f"- Активность: {user.activity_level}\n"
-            f"- Цель: {user.goal}\n"
-            f"- Норма: {user.calories_target} ккал\n"
-            f"- БЖУ: {user.protein_g_target}/{user.fat_g_target}/{user.carbs_g_target} г"
+            f"- Цель: {_fmt_goal(user.goal)}\n"
+            f"- Поддержание (TDEE): {meta.tdee_kcal} ккал\n"
+            f"- Дефицит: {meta.deficit_kcal} ккал/день ({_fmt_pct(meta.deficit_pct)})\n"
+            f"- Норма: {t.calories} ккал\n"
+            f"- БЖУ: {t.protein_g}/{t.fat_g}/{t.carbs_g} г"
             ,
             reply_markup=main_menu_kb(),
         )
@@ -205,29 +263,39 @@ async def cmd_weight(message: Message) -> None:
 
     async with SessionLocal() as db:
         repo = UserRepo(db)
+        pref_repo = PreferenceRepo(db)
         user = await repo.get_or_create(message.from_user.id, message.from_user.username)
         if not user.profile_complete:
             await message.answer("Сначала заполним профиль: /start")
             return
 
         user.weight_kg = float(w)
-        t = compute_targets(
+        prefs = await pref_repo.get_json(user.id)
+        deficit_pct = prefs.get("deficit_pct")
+        t, meta = compute_targets_with_meta(
             sex=user.sex,  # type: ignore[arg-type]
             age=user.age,
             height_cm=user.height_cm,
             weight_kg=user.weight_kg,
             activity=user.activity_level,  # type: ignore[arg-type]
             goal=user.goal,  # type: ignore[arg-type]
+            deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
         )
         user.calories_target = t.calories
         user.protein_g_target = t.protein_g
         user.fat_g_target = t.fat_g
         user.carbs_g_target = t.carbs_g
+        await pref_repo.merge(
+            user.id,
+            {"bmr_kcal": meta.bmr_kcal, "tdee_kcal": meta.tdee_kcal, "deficit_pct": meta.deficit_pct},
+        )
         await db.commit()
 
     await message.answer(
         f"Обновил вес: <b>{w} кг</b>.\n"
-        f"Новая норма: <b>{t.calories} ккал</b>, БЖУ: <b>{t.protein_g}/{t.fat_g}/{t.carbs_g} г</b>"
+        f"Поддержание (TDEE): <b>{meta.tdee_kcal} ккал</b>\n"
+        f"Дефицит: <b>{meta.deficit_kcal} ккал/день</b> ({_fmt_pct(meta.deficit_pct)})\n"
+        f"Целевая норма: <b>{t.calories} ккал</b>, БЖУ: <b>{t.protein_g}/{t.fat_g}/{t.carbs_g} г</b>"
         ,
         reply_markup=main_menu_kb(),
     )
@@ -302,14 +370,53 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
         answers["activity_level"] = a
 
     elif step == 6:
+        if data.get("awaiting_goal_tempo"):
+            tempo = _parse_tempo_choice(text)
+            if tempo is None:
+                await message.answer("Выбери темп кнопкой ниже.", reply_markup=goal_tempo_kb())
+                return True
+            tempo_key, deficit_pct = tempo
+            # keep goal, but allow explicit override by tempo choice
+            if tempo_key == "maintain":
+                answers["goal"] = "maintain"
+            elif tempo_key == "gain":
+                answers["goal"] = "gain"
+            elif tempo_key == "recomp":
+                answers["goal"] = "recomp"
+            else:
+                # for soft/standard/hard we assume fat loss mode
+                answers["goal"] = answers.get("goal") or "loss"
+                if answers["goal"] not in {"loss", "recomp"}:
+                    answers["goal"] = "loss"
+
+            answers["deficit_pct"] = float(deficit_pct)
+            answers["tempo_key"] = tempo_key
+
+            # advance to next question
+            next_step = step + 1
+            await user_repo.set_dialog(user, state="onboarding", step=next_step, data={"answers": answers})
+            await message.answer(f"{next_step}/10 — {ONBOARDING_QUESTIONS[next_step]}", reply_markup=ReplyKeyboardRemove())
+            return True
+
         g = _map_goal(text)
         if g is None:
-            # fallback: accept arbitrary text as recomp-ish / maintain, but ask once if totally unclear
-            await message.answer(
-                "Понял. Уточни одним словом (можно так): похудение / поддержка / набор / рекомпозиция."
-            )
+            await message.answer("Напиши цель (например: «рекомпозиция», «похудение до 105 кг», «набор»).")
             return True
+
         answers["goal"] = g
+        answers["goal_raw"] = (message.text or "").strip()
+        await user_repo.set_dialog(
+            user,
+            state="onboarding",
+            step=step,
+            data={"answers": answers, "awaiting_goal_tempo": True},
+        )
+        await message.answer(
+            f"Ок, цель: <b>{_fmt_goal(g)}</b>.\n"
+            "Теперь выбери темп (он влияет на дефицит/профицит):",
+            reply_markup=goal_tempo_kb(),
+        )
+        return True
 
     elif step == 7:
         answers["allergies"] = text.strip()
@@ -341,13 +448,19 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
         if not user.stores_csv:
             user.stores_csv = settings.default_stores
 
-        t = compute_targets(
+        pref_repo = PreferenceRepo(user_repo.db)
+        deficit_pct = answers.get("deficit_pct")
+        goal_raw = answers.get("goal_raw")
+        tempo_key = answers.get("tempo_key")
+
+        t, meta = compute_targets_with_meta(
             sex=user.sex,  # type: ignore[arg-type]
             age=user.age,
             height_cm=user.height_cm,
             weight_kg=user.weight_kg,
             activity=user.activity_level,  # type: ignore[arg-type]
             goal=user.goal,  # type: ignore[arg-type]
+            deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
         )
         user.calories_target = t.calories
         user.protein_g_target = t.protein_g
@@ -355,11 +468,26 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
         user.carbs_g_target = t.carbs_g
         user.profile_complete = True
 
+        # store “truth” of calculation in preferences (no schema changes)
+        await pref_repo.merge(
+            user.id,
+            {
+                "goal_raw": goal_raw,
+                "tempo_key": tempo_key,
+                "deficit_pct": meta.deficit_pct,
+                "bmr_kcal": meta.bmr_kcal,
+                "tdee_kcal": meta.tdee_kcal,
+            },
+        )
+
         await user_repo.set_dialog(user, state=None, step=None, data=None)
 
         await message.answer(
             "Готово! Рассчитал твою норму и сохранил профиль.\n\n"
-            f"Норма: <b>{t.calories} ккал</b>\n"
+            f"Поддержание (TDEE): <b>{meta.tdee_kcal} ккал</b>\n"
+            f"Цель: <b>{_fmt_goal(user.goal)}</b>, темп: <b>{_fmt_pct(meta.deficit_pct)}</b>\n"
+            f"Дефицит: <b>{meta.deficit_kcal} ккал/день</b>\n\n"
+            f"Целевая норма: <b>{t.calories} ккал</b>\n"
             f"БЖУ: <b>{t.protein_g}/{t.fat_g}/{t.carbs_g} г</b>\n\n"
             "Дальше можешь:\n"
             "- прислать фото еды\n"

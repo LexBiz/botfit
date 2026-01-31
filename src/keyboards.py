@@ -29,3 +29,21 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         input_field_placeholder="Выбери действие или просто напиши текстом",
     )
 
+
+def goal_tempo_kb() -> ReplyKeyboardMarkup:
+    # universal set; assistant will clamp if needed
+    rows = [
+        ["🔥 Жёстко (быстрее)"],
+        ["✅ Стандарт"],
+        ["🟢 Мягко"],
+        ["🧱 Рекомпозиция"],
+        ["⚖️ Поддержание"],
+        ["📈 Набор"],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Выбери темп",
+    )
+

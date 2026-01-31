@@ -40,6 +40,37 @@ class UserRepo:
         return loads(user.dialog_data_json)
 
 
+class PreferenceRepo:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def get(self, user_id: int) -> Preference:
+        q: Select[tuple[Preference]] = select(Preference).where(Preference.user_id == user_id)
+        res = await self.db.execute(q)
+        pref = res.scalar_one_or_none()
+        if pref:
+            return pref
+        pref = Preference(user_id=user_id, json=dumps({}))
+        self.db.add(pref)
+        await self.db.flush()
+        return pref
+
+    async def get_json(self, user_id: int) -> dict[str, Any]:
+        pref = await self.get(user_id)
+        obj = loads(pref.json) if pref.json else {}
+        return obj if isinstance(obj, dict) else {}
+
+    async def set_json(self, user_id: int, obj: dict[str, Any]) -> None:
+        pref = await self.get(user_id)
+        pref.json = dumps(obj)
+
+    async def merge(self, user_id: int, patch: dict[str, Any]) -> dict[str, Any]:
+        obj = await self.get_json(user_id)
+        obj.update(patch)
+        await self.set_json(user_id, obj)
+        return obj
+
+
 class MealRepo:
     def __init__(self, db: AsyncSession):
         self.db = db
