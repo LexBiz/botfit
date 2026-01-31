@@ -29,6 +29,18 @@ from src.prompts import (
     WEEKLY_ANALYSIS_JSON,
 )
 from src.food_service import FoodService, compute_item_macros
+from src.keyboards import (
+    BTN_HELP,
+    BTN_LOG_MEAL,
+    BTN_MENU,
+    BTN_PHOTO_HELP,
+    BTN_PLAN,
+    BTN_PROFILE,
+    BTN_RECIPE,
+    BTN_WEEK,
+    BTN_WEIGHT,
+    main_menu_kb,
+)
 from src.render import recipe_table
 from src.recipe_calc import compute_totals, parse_ingredients_block
 from src.repositories import FoodRepo, MealRepo, PlanRepo, StatRepo, UserRepo
@@ -123,6 +135,8 @@ async def cmd_start(message: Message) -> None:
                 "Ты уже заполнил профиль.\n"
                 "Команды: /profile, /reset, /help\n"
                 "Можешь прислать фото еды / написать прием пищи / попросить рацион."
+                ,
+                reply_markup=main_menu_kb(),
             )
             return
 
@@ -149,6 +163,8 @@ async def cmd_profile(message: Message) -> None:
             f"- Цель: {user.goal}\n"
             f"- Норма: {user.calories_target} ккал\n"
             f"- БЖУ: {user.protein_g_target}/{user.fat_g_target}/{user.carbs_g_target} г"
+            ,
+            reply_markup=main_menu_kb(),
         )
 
 
@@ -163,6 +179,8 @@ async def cmd_help(message: Message) -> None:
         "- /week — анализ дневника за 7 дней\n"
         "- /recipe — расчет рецепта по ингредиентам (КБЖУ)\n"
         "- /reset — сброс профиля"
+        "\n\nМожно и без команд — используй кнопки меню ниже.",
+        reply_markup=main_menu_kb(),
     )
 
 
@@ -202,6 +220,8 @@ async def cmd_weight(message: Message) -> None:
     await message.answer(
         f"Обновил вес: <b>{w} кг</b>.\n"
         f"Новая норма: <b>{t.calories} ккал</b>, БЖУ: <b>{t.protein_g}/{t.fat_g}/{t.carbs_g} г</b>"
+        ,
+        reply_markup=main_menu_kb(),
     )
 
 @router.message(Command("reset"))
@@ -226,7 +246,7 @@ async def cmd_reset(message: Message) -> None:
         user.carbs_g_target = None
         await repo.set_dialog(user, state=None, step=None, data=None)
         await db.commit()
-    await message.answer("Профиль сброшен. Напиши /start чтобы пройти анкету заново.")
+    await message.answer("Профиль сброшен. Напиши /start чтобы пройти анкету заново.", reply_markup=main_menu_kb())
 
 
 async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: Any) -> bool:
@@ -335,6 +355,8 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
             "- написать список продуктов/ингредиентов\n"
             "- попросить «составь рацион на день»\n"
             "Команды: /profile, /reset"
+            ,
+            reply_markup=main_menu_kb(),
         )
         return True
 
@@ -659,9 +681,9 @@ async def photo_message(message: Message, bot: Bot) -> None:
             f"Скрытые калории: {', '.join(hidden) if hidden else '—'}\n\n"
         )
         if questions:
-            await message.answer(intro + "Уточню пару деталей.\n\n" + questions[0])
+            await message.answer(intro + "Уточню пару деталей.\n\n" + questions[0], reply_markup=main_menu_kb())
         else:
-            await message.answer(intro + "Не вижу что уточнять. Напиши примерно масло/соус/порцию — и посчитаю КБЖУ.")
+            await message.answer(intro + "Не вижу что уточнять. Напиши примерно масло/соус/порцию — и посчитаю КБЖУ.", reply_markup=main_menu_kb())
 
 
 @router.message(F.voice)
@@ -989,12 +1011,14 @@ async def cmd_recipe(message: Message) -> None:
             "Пришли ингредиенты в формате строк, например:\n"
             "<pre>курица 200г 220ккал Б 40 Ж 5 У 0\nрис 150г 180ккал Б 4 Ж 1 У 38</pre>\n"
             "И я посчитаю итог и на 100г."
+            ,
+            reply_markup=main_menu_kb(),
         )
         return
 
     rows = parse_ingredients_block(payload)
     if not rows:
-        await message.answer("Не смог распознать строки. Нужны: граммы, ккал, Б/Ж/У на строку.")
+        await message.answer("Не смог распознать строки. Нужны: граммы, ккал, Б/Ж/У на строку.", reply_markup=main_menu_kb())
         return
 
     totals = compute_totals(rows)
@@ -1007,6 +1031,8 @@ async def cmd_recipe(message: Message) -> None:
         f"Б {totals['protein_g']:.1f} / Ж {totals['fat_g']:.1f} / У {totals['carbs_g']:.1f}\n"
         f"На 100г: {per100.get('calories', 0):.0f} ккал, "
         f"Б {per100.get('protein_g', 0):.1f} / Ж {per100.get('fat_g', 0):.1f} / У {per100.get('carbs_g', 0):.1f}"
+        ,
+        reply_markup=main_menu_kb(),
     )
 
 
@@ -1145,6 +1171,69 @@ async def any_text(message: Message) -> None:
 
         if not user.profile_complete:
             await message.answer("Сначала заполним профиль: напиши /start")
+            return
+
+        # Menu buttons
+        t = (message.text or "").strip()
+        if t in {BTN_MENU}:
+            await message.answer("Меню:", reply_markup=main_menu_kb())
+            return
+        if t in {BTN_HELP}:
+            await cmd_help(message)
+            return
+        if t in {BTN_PROFILE}:
+            await cmd_profile(message)
+            return
+        if t in {BTN_PLAN}:
+            await cmd_plan(message)
+            return
+        if t in {BTN_WEEK}:
+            await cmd_week(message)
+            return
+        if t in {BTN_RECIPE}:
+            await message.answer(
+                "Пришли ингредиенты строками (как в /recipe), и я посчитаю итог и на 100г.",
+                reply_markup=main_menu_kb(),
+            )
+            return
+        if t in {BTN_WEIGHT}:
+            await user_repo.set_dialog(user, state="set_weight", step=0, data=None)
+            await db.commit()
+            await message.answer("Напиши новый вес в кг (например: 82.5).", reply_markup=main_menu_kb())
+            return
+        if t in {BTN_PHOTO_HELP}:
+            await message.answer("Ок. Просто отправь фото блюда сюда — я разберу и посчитаю.", reply_markup=main_menu_kb())
+            return
+        if t in {BTN_LOG_MEAL}:
+            await message.answer("Ок. Напиши прием пищи (например: «гречка 200г, курица 150г, масло 10г»).", reply_markup=main_menu_kb())
+            return
+
+        # set_weight dialog
+        if user.dialog_state == "set_weight":
+            w = _parse_float(t)
+            if w is None:
+                await message.answer("Вес числом (пример: 82.5).", reply_markup=main_menu_kb())
+                return
+            user.weight_kg = float(w)
+            tr = compute_targets(
+                sex=user.sex,  # type: ignore[arg-type]
+                age=user.age,
+                height_cm=user.height_cm,
+                weight_kg=user.weight_kg,
+                activity=user.activity_level,  # type: ignore[arg-type]
+                goal=user.goal,  # type: ignore[arg-type]
+            )
+            user.calories_target = tr.calories
+            user.protein_g_target = tr.protein_g
+            user.fat_g_target = tr.fat_g
+            user.carbs_g_target = tr.carbs_g
+            await user_repo.set_dialog(user, state=None, step=None, data=None)
+            await db.commit()
+            await message.answer(
+                f"Обновил вес: <b>{w} кг</b>.\n"
+                f"Новая норма: <b>{tr.calories} ккал</b>, БЖУ: <b>{tr.protein_g}/{tr.fat_g}/{tr.carbs_g} г</b>",
+                reply_markup=main_menu_kb(),
+            )
             return
 
         # Agent router (free-form commands)
