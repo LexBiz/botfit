@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Any
+from typing import Any, Iterable
 
 from openai import AsyncOpenAI
 
@@ -15,7 +15,8 @@ client = AsyncOpenAI(api_key=settings.openai_api_key)
 def _is_unsupported_param_error(e: Exception, param: str) -> bool:
     # openai-python raises different exception types across versions; parse message best-effort
     msg = str(e).lower()
-    return ("unsupported parameter" in msg or "invalid_request_error" in msg) and param.lower() in msg
+    p = param.lower()
+    return ("unsupported parameter" in msg or "invalid_request_error" in msg) and (p in msg or f"'{p}'" in msg)
 
 
 def _has_responses_api() -> bool:
@@ -42,6 +43,44 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _strict_json_suffix() -> str:
+    return "\n\nВАЖНО: верни ТОЛЬКО валидный JSON-объект. Без текста, без markdown."
+
+
+async def _chat_create(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_output_tokens: int,
+    response_format: dict[str, Any] | None,
+) -> str:
+    """
+    Best-effort compatibility layer for Chat Completions across model/SDK differences.
+    """
+    # Try combinations in decreasing strictness.
+    attempts: list[dict[str, Any]] = []
+    if response_format is not None:
+        attempts.append({"response_format": response_format, "max_completion_tokens": max_output_tokens})
+        attempts.append({"response_format": response_format, "max_tokens": max_output_tokens})
+    attempts.append({"max_completion_tokens": max_output_tokens})
+    attempts.append({"max_tokens": max_output_tokens})
+
+    last_err: Exception | None = None
+    for kw in attempts:
+        try:
+            cc = await client.chat.completions.create(model=model, messages=messages, **kw)
+            return (cc.choices[0].message.content or "").strip()
+        except Exception as e:
+            last_err = e
+            # If this attempt failed due to an unsupported param, continue to next combination
+            if any(_is_unsupported_param_error(e, p) for p in ("max_completion_tokens", "max_tokens", "response_format")):
+                continue
+            # Some SDKs return dict-like errors; still allow next attempt
+            continue
+
+    raise RuntimeError(f"Chat completion failed. Last error: {last_err}")
+
+
 async def text_json(
     *,
     system: str,
@@ -65,45 +104,37 @@ async def text_json(
         text = (getattr(resp, "output_text", None) or "").strip()
     else:
         # Fallback: Chat Completions API (older SDKs).
-        messages = [
+        base_messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        try:
-            cc = await client.chat.completions.create(
-                model=m,
-                messages=messages,
-                response_format={"type": "json_object"},
-                max_completion_tokens=max_output_tokens,
-            )
-        except Exception as e:
-            # Some models/SDKs use max_tokens instead
-            if _is_unsupported_param_error(e, "max_completion_tokens"):
-                cc = await client.chat.completions.create(
-                    model=m,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    max_tokens=max_output_tokens,
-                )
-            else:
-                # If response_format is not supported, retry without it
-                try:
-                    cc = await client.chat.completions.create(
-                        model=m,
-                        messages=messages,
-                        max_completion_tokens=max_output_tokens,
-                    )
-                except Exception:
-                    cc = await client.chat.completions.create(
-                        model=m,
-                        messages=messages,
-                        max_tokens=max_output_tokens,
-                    )
-        text = (cc.choices[0].message.content or "").strip()
+        # Try with strict response_format when possible
+        text = await _chat_create(
+            model=m,
+            messages=base_messages,
+            max_output_tokens=max_output_tokens,
+            response_format={"type": "json_object"},
+        )
 
     obj = _try_parse_json(text)
     if obj is None:
-        raise ValueError(f"Model did not return JSON. Got: {text[:500]}")
+        # Retry once with extra strict instruction (works even if response_format isn't supported).
+        if not _has_responses_api():
+            retry_messages = [
+                {"role": "system", "content": system + _strict_json_suffix()},
+                {"role": "user", "content": user},
+            ]
+            text2 = await _chat_create(
+                model=m,
+                messages=retry_messages,
+                max_output_tokens=max_output_tokens,
+                response_format=None,
+            )
+            obj2 = _try_parse_json(text2)
+            if obj2 is not None:
+                return obj2
+            raise ValueError(f"Model did not return JSON after retry. Got: {text2[:500]}")
+        raise ValueError(f"Model did not return JSON. Got: {text[:500] or '<empty>'}")
     return obj
 
 
@@ -139,19 +170,21 @@ async def vision_json(
         text = (getattr(resp, "output_text", None) or "").strip()
     else:
         # Fallback: Chat Completions with image_url content
+        # Preferred content shape
         content = [
             {"type": "text", "text": user_text},
             {"type": "image_url", "image_url": {"url": data_url}},
         ]
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ]
         try:
-            cc = await client.chat.completions.create(
+            text = await _chat_create(
                 model=m,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": content},
-                ],
+                messages=messages,
+                max_output_tokens=max_output_tokens,
                 response_format={"type": "json_object"},
-                max_completion_tokens=max_output_tokens,
             )
         except Exception:
             # some variants accept image_url as string
@@ -159,52 +192,36 @@ async def vision_json(
                 {"type": "text", "text": user_text},
                 {"type": "image_url", "image_url": data_url},
             ]
-            try:
-                cc = await client.chat.completions.create(
-                    model=m,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": content2},
-                    ],
-                    response_format={"type": "json_object"},
-                    max_completion_tokens=max_output_tokens,
-                )
-            except Exception as e:
-                # fallback to max_tokens and/or without response_format
-                if _is_unsupported_param_error(e, "max_completion_tokens"):
-                    try:
-                        cc = await client.chat.completions.create(
-                            model=m,
-                            messages=[
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": content2},
-                            ],
-                            response_format={"type": "json_object"},
-                            max_tokens=max_output_tokens,
-                        )
-                    except Exception:
-                        cc = await client.chat.completions.create(
-                            model=m,
-                            messages=[
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": content2},
-                            ],
-                            max_tokens=max_output_tokens,
-                        )
-                else:
-                    cc = await client.chat.completions.create(
-                        model=m,
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": content2},
-                        ],
-                        max_completion_tokens=max_output_tokens,
-                    )
-        text = (cc.choices[0].message.content or "").strip()
+            messages2 = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": content2},
+            ]
+            text = await _chat_create(
+                model=m,
+                messages=messages2,
+                max_output_tokens=max_output_tokens,
+                response_format={"type": "json_object"},
+            )
 
     obj = _try_parse_json(text)
     if obj is None:
-        raise ValueError(f"Model did not return JSON. Got: {text[:500]}")
+        if not _has_responses_api():
+            # Retry once with explicit JSON-only instruction, without response_format.
+            retry_messages = [
+                {"role": "system", "content": system + _strict_json_suffix()},
+                {"role": "user", "content": [{"type": "text", "text": user_text}, {"type": "image_url", "image_url": {"url": data_url}}]},
+            ]
+            text2 = await _chat_create(
+                model=m,
+                messages=retry_messages,
+                max_output_tokens=max_output_tokens,
+                response_format=None,
+            )
+            obj2 = _try_parse_json(text2)
+            if obj2 is not None:
+                return obj2
+            raise ValueError(f"Model did not return JSON after retry. Got: {text2[:500]}")
+        raise ValueError(f"Model did not return JSON. Got: {text[:500] or '<empty>'}")
     return obj
 
 
