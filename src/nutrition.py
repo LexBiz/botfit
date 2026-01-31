@@ -6,7 +6,7 @@ from typing import Literal
 
 Sex = Literal["male", "female"]
 ActivityLevel = Literal["low", "medium", "high"]
-Goal = Literal["loss", "maintain", "gain"]
+Goal = Literal["loss", "maintain", "gain", "recomp"]
 
 
 @dataclass(frozen=True)
@@ -41,15 +41,17 @@ def calorie_target_from_goal(tdee_kcal: float, goal: Goal) -> int:
         return int(round(tdee_kcal * 0.85))  # ~15% deficit
     if goal == "gain":
         return int(round(tdee_kcal * 1.10))  # ~10% surplus
+    if goal == "recomp":
+        return int(round(tdee_kcal * 0.95))  # small deficit to recomposition
     return int(round(tdee_kcal))
 
 
 def macros_for_targets(calories: int, weight_kg: float, goal: Goal) -> Targets:
     # pragmatic default split:
-    # protein: 1.6g/kg (loss/maintain), 1.8g/kg (gain)
+    # protein: 1.6g/kg (loss/maintain), 1.8g/kg (gain/recomp)
     # fat: 0.8g/kg
     # carbs: remainder
-    protein = int(round((1.8 if goal == "gain" else 1.6) * weight_kg))
+    protein = int(round((1.8 if goal in {"gain", "recomp"} else 1.6) * weight_kg))
     fat = int(round(0.8 * weight_kg))
 
     # kcal from protein/fat

@@ -56,7 +56,7 @@ ONBOARDING_QUESTIONS = {
     3: "Рост (см)?",
     4: "Вес (кг)?",
     5: "Уровень активности? (низкий/средний/высокий)",
-    6: "Цель? (похудение/поддержка/набор)",
+    6: "Цель? (можно своими словами: похудение / набор / поддержка / рекомпозиция и т.п.)",
     7: "Аллергии? (если нет — напиши «нет»)",
     8: "Ограничения? (например: без свинины/халяль/веган/и т.п.; если нет — «нет»)",
     9: "Любимые продукты? (списком)",
@@ -112,6 +112,10 @@ def _map_goal(s: str) -> str | None:
         return "maintain"
     if "набор" in s or "мас" in s:
         return "gain"
+    if "рекомп" in s or "рекомпоз" in s or "recomp" in s or "recomposition" in s:
+        return "recomp"
+    if "подтян" in s or "тонус" in s:
+        return "recomp"
     return None
 
 
@@ -296,7 +300,10 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
     elif step == 6:
         g = _map_goal(text)
         if g is None:
-            await message.answer("Цель: похудение / поддержка / набор.")
+            # fallback: accept arbitrary text as recomp-ish / maintain, but ask once if totally unclear
+            await message.answer(
+                "Понял. Уточни одним словом (можно так): похудение / поддержка / набор / рекомпозиция."
+            )
             return True
         answers["goal"] = g
 

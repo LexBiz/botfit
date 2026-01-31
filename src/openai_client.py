@@ -11,6 +11,9 @@ from src.config import settings
 
 client = AsyncOpenAI(api_key=settings.openai_api_key)
 
+def _has_responses_api() -> bool:
+    return getattr(client, "responses", None) is not None
+
 
 def _try_parse_json(text: str) -> dict[str, Any] | None:
     t = text.strip()
@@ -41,17 +44,31 @@ async def text_json(
 ) -> dict[str, Any]:
     m = model or settings.openai_text_model
 
-    # Prefer Responses API. Ask for strict JSON (best-effort).
-    resp = await client.responses.create(
-        model=m,
-        input=[
-            {"role": "system", "content": [{"type": "input_text", "text": system}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user}]},
-        ],
-        max_output_tokens=max_output_tokens,
-    )
+    text = ""
+    if _has_responses_api():
+        # Prefer Responses API.
+        resp = await client.responses.create(
+            model=m,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": system}]},
+                {"role": "user", "content": [{"type": "input_text", "text": user}]},
+            ],
+            max_output_tokens=max_output_tokens,
+        )
+        text = (getattr(resp, "output_text", None) or "").strip()
+    else:
+        # Fallback: Chat Completions API (older SDKs).
+        cc = await client.chat.completions.create(
+            model=m,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=max_output_tokens,
+        )
+        text = (cc.choices[0].message.content or "").strip()
 
-    text = (resp.output_text or "").strip()
     obj = _try_parse_json(text)
     if obj is None:
         raise ValueError(f"Model did not return JSON. Got: {text[:500]}")
@@ -71,21 +88,56 @@ async def vision_json(
     b64 = base64.b64encode(image_bytes).decode("ascii")
     data_url = f"data:{image_mime};base64,{b64}"
 
-    resp = await client.responses.create(
-        model=m,
-        input=[
-            {"role": "system", "content": [{"type": "input_text", "text": system}]},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": user_text},
-                    {"type": "input_image", "image_url": data_url},
+    text = ""
+    if _has_responses_api():
+        resp = await client.responses.create(
+            model=m,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": system}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": user_text},
+                        {"type": "input_image", "image_url": data_url},
+                    ],
+                },
+            ],
+            max_output_tokens=max_output_tokens,
+        )
+        text = (getattr(resp, "output_text", None) or "").strip()
+    else:
+        # Fallback: Chat Completions with image_url content
+        content = [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]
+        try:
+            cc = await client.chat.completions.create(
+                model=m,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content},
                 ],
-            },
-        ],
-        max_output_tokens=max_output_tokens,
-    )
-    text = (resp.output_text or "").strip()
+                response_format={"type": "json_object"},
+                max_tokens=max_output_tokens,
+            )
+        except Exception:
+            # some variants accept image_url as string
+            content2 = [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": data_url},
+            ]
+            cc = await client.chat.completions.create(
+                model=m,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content2},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=max_output_tokens,
+            )
+        text = (cc.choices[0].message.content or "").strip()
+
     obj = _try_parse_json(text)
     if obj is None:
         raise ValueError(f"Model did not return JSON. Got: {text[:500]}")
