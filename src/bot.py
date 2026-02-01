@@ -581,6 +581,7 @@ def _format_food_pick_question(ctx: dict[str, Any], idx: int) -> str:
             f"({c.get('kcal_100g')} ккал/100г) [barcode: {c.get('barcode')}]"
         )
     lines.append("\nОтветь цифрой (1-5) или пришли штрихкод.")
+    lines.append("Чтобы отменить — напиши: ❌ Отмена")
     return "\n".join(lines)
 
 
@@ -680,6 +681,24 @@ async def _build_meal_from_items(
 async def _handle_food_pick(message: Message, user_repo: UserRepo, food_service: FoodService, user: Any) -> dict[str, Any] | None:
     if user.dialog_state != "food_pick":
         return None
+
+    # allow cancel / menu escape to prevent loops
+    t = (message.text or "").strip()
+    if t in {
+        "❌ Отмена",
+        BTN_MENU,
+        BTN_HELP,
+        BTN_PROFILE,
+        BTN_WEIGHT,
+        BTN_LOG_MEAL,
+        BTN_PHOTO_HELP,
+        BTN_PLAN,
+        BTN_WEEK,
+        BTN_RECIPE,
+    }:
+        await user_repo.set_dialog(user, state=None, step=None, data=None)
+        await message.answer("Ок, отменил выбор продукта.", reply_markup=main_menu_kb())
+        return {"handled": True}
 
     data = loads(user.dialog_data_json) or {}
     ctx = data.get("ctx") or {}
