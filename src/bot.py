@@ -153,6 +153,45 @@ def _safe_nonempty_text(s: str | None, *, fallback: str) -> str:
     return t if t else fallback
 
 
+async def _send_html_lines(
+    message: Message,
+    *,
+    header: str,
+    lines: list[str],
+    reply_markup: Any = None,
+    limit: int = 3900,
+) -> None:
+    """
+    Telegram has a hard 4096 limit; we keep some headroom.
+    IMPORTANT: never cut HTML tags (e.g. <a href="...">) by slicing mid-string.
+    We chunk by whole lines only.
+    """
+    chunks: list[str] = []
+    cur = header.strip()
+    for ln in lines:
+        ln = str(ln or "").strip()
+        if not ln:
+            continue
+        cand = cur + ("\n" if cur else "") + ln
+        if len(cand) <= limit:
+            cur = cand
+            continue
+        # flush current chunk
+        if cur:
+            chunks.append(cur)
+        # start new chunk with header repeated for clarity
+        cur = header.strip() + "\n" + ln
+        if len(cur) > limit:
+            # if a single line is too long, drop links safely (avoid malformed HTML)
+            safe_ln = re.sub(r"\s*<a href=\"[^\"]+\">[^<]+</a>\s*(\|\s*)?", " ", ln).strip()
+            cur = header.strip() + "\n" + safe_ln[: max(0, limit - len(header) - 1)]
+    if cur:
+        chunks.append(cur)
+
+    for ch in chunks[:5]:  # safety: don't spam
+        await message.answer(ch, reply_markup=reply_markup or main_menu_kb())
+
+
 def _has_cyrillic_text(s: str) -> bool:
     return any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in (s or ""))
 
@@ -300,10 +339,14 @@ async def _send_plans(
             f"\n✅ <b>Итого дня</b>: 🔥 {totals.get('kcal')} ккал | 🥩 {totals.get('protein_g')} | 🧈 {totals.get('fat_g')} | 🍚 {totals.get('carbs_g')}"
         )
 
-    shopping_text = "🛒 <b>Список покупок (суммарно)</b>:\n" + "\n".join(shopping_lines) if shopping_lines else ""
     await message.answer("\n".join(parts)[:3900], reply_markup=main_menu_kb())
-    if shopping_text:
-        await message.answer(shopping_text[:3900], reply_markup=main_menu_kb())
+    if shopping_lines:
+        await _send_html_lines(
+            message,
+            header="🛒 <b>Список покупок (суммарно)</b>:",
+            lines=shopping_lines,
+            reply_markup=main_menu_kb(),
+        )
 
 def _active_targets(
     *,
