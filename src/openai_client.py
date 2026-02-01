@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Any, Iterable
+from typing import Any
 
 from openai import AsyncOpenAI
 
@@ -57,28 +57,83 @@ async def _chat_create(
     """
     Best-effort compatibility layer for Chat Completions across model/SDK differences.
     """
-    # Try combinations in decreasing strictness.
-    attempts: list[dict[str, Any]] = []
-    if response_format is not None:
-        attempts.append({"response_format": response_format, "max_completion_tokens": max_output_tokens})
-        attempts.append({"response_format": response_format, "max_tokens": max_output_tokens})
-    attempts.append({"max_completion_tokens": max_output_tokens})
-    attempts.append({"max_tokens": max_output_tokens})
-
+    # Important: some models reject max_tokens and require max_completion_tokens.
+    # We only try max_tokens branch if max_completion_tokens is explicitly unsupported.
     last_err: Exception | None = None
-    for kw in attempts:
-        try:
-            cc = await client.chat.completions.create(model=model, messages=messages, **kw)
-            return (cc.choices[0].message.content or "").strip()
-        except Exception as e:
-            last_err = e
-            # If this attempt failed due to an unsupported param, continue to next combination
-            if any(_is_unsupported_param_error(e, p) for p in ("max_completion_tokens", "max_tokens", "response_format")):
-                continue
-            # Some SDKs return dict-like errors; still allow next attempt
-            continue
 
-    raise RuntimeError(f"Chat completion failed. Last error: {last_err}")
+    # 1) Try max_completion_tokens with/without response_format
+    try:
+        kwargs: dict[str, Any] = {"max_completion_tokens": max_output_tokens}
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        cc = await client.chat.completions.create(model=model, messages=messages, **kwargs)
+        return (cc.choices[0].message.content or "").strip()
+    except Exception as e:
+        last_err = e
+        if response_format is not None and _is_unsupported_param_error(e, "response_format"):
+            try:
+                cc = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_completion_tokens=max_output_tokens,
+                )
+                return (cc.choices[0].message.content or "").strip()
+            except Exception as e2:
+                last_err = e2
+        # If max_completion_tokens is supported, do NOT fall back to max_tokens.
+        if not _is_unsupported_param_error(last_err, "max_completion_tokens"):
+            raise RuntimeError(f"Chat completion failed. Last error: {last_err}")
+
+    # 2) Fallback to max_tokens (only if max_completion_tokens unsupported)
+    try:
+        kwargs2: dict[str, Any] = {"max_tokens": max_output_tokens}
+        if response_format is not None:
+            kwargs2["response_format"] = response_format
+        cc = await client.chat.completions.create(model=model, messages=messages, **kwargs2)
+        return (cc.choices[0].message.content or "").strip()
+    except Exception as e:
+        last_err = e
+        if response_format is not None and _is_unsupported_param_error(e, "response_format"):
+            cc = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_output_tokens,
+            )
+            return (cc.choices[0].message.content or "").strip()
+        raise RuntimeError(f"Chat completion failed. Last error: {last_err}")
+
+
+async def text_output(
+    *,
+    system: str,
+    user: str,
+    model: str | None = None,
+    max_output_tokens: int = 800,
+) -> str:
+    """
+    Like text_json, but returns raw text (never parses JSON). Used as a safe fallback.
+    """
+    m = model or settings.openai_text_model
+    if _has_responses_api():
+        resp = await client.responses.create(
+            model=m,
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": system}]},
+                {"role": "user", "content": [{"type": "input_text", "text": user}]},
+            ],
+            max_output_tokens=max_output_tokens,
+        )
+        return (getattr(resp, "output_text", None) or "").strip()
+
+    return await _chat_create(
+        model=m,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        max_output_tokens=max_output_tokens,
+        response_format=None,
+    )
 
 
 async def text_json(

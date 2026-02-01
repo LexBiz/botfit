@@ -18,7 +18,7 @@ from aiogram.types import ReplyKeyboardRemove
 
 from src.nutrition import compute_targets, compute_targets_with_meta
 from src.audio import ogg_opus_to_wav_bytes
-from src.openai_client import text_json, transcribe_audio, vision_json
+from src.openai_client import text_json, text_output, transcribe_audio, vision_json
 from src.prompts import (
     DAY_PLAN_JSON,
     MEAL_ITEMS_JSON,
@@ -1110,8 +1110,15 @@ async def cmd_plan(message: Message) -> None:
                 user=_profile_context(user) + f"\nСоставь рацион на день на {user.calories_target} ккал.",
                 max_output_tokens=1400,
             )
-        except Exception as e:
-            await message.answer(f"Не смог составить рацион (ошибка): {e}")
+        except Exception:
+            # Safe fallback: return plain text plan instead of failing.
+            plan_text = await text_output(
+                system=SYSTEM_NUTRITIONIST
+                + "\nСоставь рацион на день для Чехии (Lidl/Kaufland/Albert) с граммовками, рецептами и КБЖУ. Пиши структурировано.",
+                user=_profile_context(user) + f"\nНорма: {user.calories_target} ккал. Составь рацион на день.",
+                max_output_tokens=1400,
+            )
+            await message.answer(plan_text[:3900], reply_markup=main_menu_kb())
             return
 
         meals = plan.get("meals") or []
@@ -1215,8 +1222,14 @@ async def cmd_week(message: Message) -> None:
                 user=_profile_context(user) + "\nДневник за 7 дней:\n" + dumps(diary),
                 max_output_tokens=1200,
             )
-        except Exception as e:
-            await message.answer(f"Не смог проанализировать неделю (ошибка): {e}")
+        except Exception:
+            txt = await text_output(
+                system=SYSTEM_NUTRITIONIST
+                + "\nПроанализируй дневник за 7 дней и профиль: ошибки, рекомендации, поддержка. Пиши пунктами.",
+                user=_profile_context(user) + "\nДневник за 7 дней:\n" + dumps(diary),
+                max_output_tokens=1200,
+            )
+            await message.answer(txt[:3900], reply_markup=main_menu_kb())
             return
 
         parts = [

@@ -60,3 +60,19 @@ async def test_text_json_uses_max_completion_tokens_first(monkeypatch: pytest.Mo
     assert obj["ok"] is True
     assert seen["max_completion_tokens"] is True
 
+
+@pytest.mark.asyncio
+async def test_text_output_returns_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc, "_has_responses_api", lambda: False)
+
+    async def fake_create(**kwargs):
+        return DummyCC("plain text")
+
+    fake_client = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=fake_create))
+    )
+    monkeypatch.setattr(oc, "client", fake_client)
+
+    t = await oc.text_output(system="s", user="u", model="x", max_output_tokens=10)
+    assert "plain text" in t
+
