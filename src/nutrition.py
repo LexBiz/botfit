@@ -123,6 +123,14 @@ def compute_targets_with_meta(
     b = bmr_mifflin_st_jeor(sex=sex, age=age, height_cm=height_cm, weight_kg=weight_kg)
     td = tdee(b, activity=activity)
     cal, pct = calorie_target_from_tdee(td, goal=goal, deficit_pct=deficit_pct)
+    # safety: don't go below ~80% BMR for loss/recomp, and hard floors
+    if goal in {"loss", "recomp"}:
+        hard_floor = 1500 if sex == "male" else 1200
+        min_cal = max(int(round(b * 0.80)), hard_floor)
+        if cal < min_cal:
+            cal = min_cal
+            # recompute pct from adjusted calories
+            pct = max(min(1.0 - (cal / float(td)), 0.30), 0.05) if goal == "recomp" else max(min(1.0 - (cal / float(td)), 0.30), 0.10)
     targets = macros_for_targets(cal, weight_kg=weight_kg, goal=goal)
     meta = CalcMeta(
         bmr_kcal=int(round(b)),

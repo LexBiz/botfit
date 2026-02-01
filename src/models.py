@@ -141,6 +141,53 @@ class CoachNote(Base):
     note_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class Goal(Base):
+    __tablename__ = "goals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), index=True)
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    phase: Mapped[str] = mapped_column(String(16), default="cut")  # cut/maintain/recomp/gain
+    target_weight_kg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_date: Mapped[dt.date | None] = mapped_column(Date, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class WeightLog(Base):
+    __tablename__ = "weight_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), index=True)
+
+    date: Mapped[dt.date] = mapped_column(Date, index=True)
+    weight_kg: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
+
+
+class DailyCheckin(Base):
+    __tablename__ = "daily_checkins"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), index=True)
+
+    date: Mapped[dt.date] = mapped_column(Date, index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
+
+    # structured
+    calories_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    protein_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sleep_hours: Mapped[float | None] = mapped_column(Float, nullable=True)
+    training_done: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    alcohol: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    note_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class Food(Base):
     """
     Cache of products from external food databases (e.g. OpenFoodFacts).
@@ -170,4 +217,7 @@ class Food(Base):
 Index("ix_meals_user_created", Meal.user_id, Meal.created_at)
 Index("ix_foods_source_barcode", Food.source, Food.barcode)
 Index("ix_coach_notes_user_created", CoachNote.user_id, CoachNote.created_at)
+Index("ix_goals_user_created", Goal.user_id, Goal.created_at)
+Index("ix_weight_logs_user_date", WeightLog.user_id, WeightLog.date)
+Index("ix_daily_checkins_user_date", DailyCheckin.user_id, DailyCheckin.date)
 

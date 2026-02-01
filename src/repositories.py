@@ -7,7 +7,7 @@ from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.jsonutil import dumps, loads
-from src.models import CoachNote, Food, Meal, Plan, Preference, Stat, User
+from src.models import CoachNote, DailyCheckin, Food, Goal, Meal, Plan, Preference, Stat, User, WeightLog
 
 
 class UserRepo:
@@ -190,6 +190,126 @@ class CoachNoteRepo:
                     "title": n.title,
                     "note_json": obj if isinstance(obj, (dict, list)) else None,
                     "note_text": n.note_text,
+                }
+            )
+        return out
+
+
+class GoalRepo:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def get_active(self, user_id: int) -> Goal | None:
+        q: Select[tuple[Goal]] = select(Goal).where(Goal.user_id == user_id).where(Goal.active == True)  # noqa: E712
+        res = await self.db.execute(q)
+        return res.scalar_one_or_none()
+
+    async def set_goal(
+        self,
+        *,
+        user_id: int,
+        phase: str,
+        target_weight_kg: float | None,
+        target_date: dt.date | None,
+        notes: str | None,
+    ) -> Goal:
+        cur = await self.get_active(user_id)
+        if cur:
+            cur.phase = phase
+            cur.target_weight_kg = target_weight_kg
+            cur.target_date = target_date
+            cur.notes = notes
+            return cur
+        g = Goal(user_id=user_id, phase=phase, target_weight_kg=target_weight_kg, target_date=target_date, notes=notes, active=True)
+        self.db.add(g)
+        await self.db.flush()
+        return g
+
+
+class WeightLogRepo:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def upsert(self, *, user_id: int, date: dt.date, weight_kg: float) -> WeightLog:
+        q: Select[tuple[WeightLog]] = select(WeightLog).where(WeightLog.user_id == user_id).where(WeightLog.date == date)
+        res = await self.db.execute(q)
+        w = res.scalar_one_or_none()
+        if w:
+            w.weight_kg = float(weight_kg)
+            return w
+        w = WeightLog(user_id=user_id, date=date, weight_kg=float(weight_kg))
+        self.db.add(w)
+        await self.db.flush()
+        return w
+
+    async def last_days(self, user_id: int, days: int = 21) -> list[dict[str, Any]]:
+        start = dt.date.today() - dt.timedelta(days=days)
+        q = (
+            select(WeightLog)
+            .where(WeightLog.user_id == user_id)
+            .where(WeightLog.date >= start)
+            .order_by(WeightLog.date.asc())
+        )
+        res = await self.db.execute(q)
+        return [{"date": x.date.isoformat(), "weight_kg": x.weight_kg} for x in res.scalars().all()]
+
+
+class DailyCheckinRepo:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def upsert(
+        self,
+        *,
+        user_id: int,
+        date: dt.date,
+        calories_ok: bool | None,
+        protein_ok: bool | None,
+        steps: int | None,
+        sleep_hours: float | None,
+        training_done: bool | None,
+        alcohol: bool | None,
+        note_text: str | None,
+        raw_json: dict[str, Any] | None,
+    ) -> DailyCheckin:
+        q: Select[tuple[DailyCheckin]] = select(DailyCheckin).where(DailyCheckin.user_id == user_id).where(DailyCheckin.date == date)
+        res = await self.db.execute(q)
+        c = res.scalar_one_or_none()
+        if not c:
+            c = DailyCheckin(user_id=user_id, date=date)
+            self.db.add(c)
+        c.calories_ok = calories_ok
+        c.protein_ok = protein_ok
+        c.steps = steps
+        c.sleep_hours = sleep_hours
+        c.training_done = training_done
+        c.alcohol = alcohol
+        c.note_text = note_text
+        c.raw_json = dumps(raw_json) if raw_json is not None else None
+        await self.db.flush()
+        return c
+
+    async def last_days(self, user_id: int, days: int = 14) -> list[dict[str, Any]]:
+        start = dt.date.today() - dt.timedelta(days=days)
+        q = (
+            select(DailyCheckin)
+            .where(DailyCheckin.user_id == user_id)
+            .where(DailyCheckin.date >= start)
+            .order_by(DailyCheckin.date.asc())
+        )
+        res = await self.db.execute(q)
+        out: list[dict[str, Any]] = []
+        for x in res.scalars().all():
+            out.append(
+                {
+                    "date": x.date.isoformat(),
+                    "calories_ok": x.calories_ok,
+                    "protein_ok": x.protein_ok,
+                    "steps": x.steps,
+                    "sleep_hours": x.sleep_hours,
+                    "training_done": x.training_done,
+                    "alcohol": x.alcohol,
+                    "note_text": x.note_text,
                 }
             )
         return out

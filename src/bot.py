@@ -28,6 +28,7 @@ from src.prompts import (
     COACH_MEMORY_JSON,
     COACH_CHAT_GUIDE,
     PROGRESS_PHOTO_JSON,
+    DAILY_CHECKIN_JSON,
     DAY_PLAN_JSON,
     MEAL_ITEMS_JSON,
     MEAL_FROM_PHOTO_FINAL_JSON,
@@ -56,7 +57,18 @@ from src.keyboards import (
 )
 from src.render import recipe_table
 from src.recipe_calc import compute_totals, parse_ingredients_block
-from src.repositories import CoachNoteRepo, FoodRepo, MealRepo, PlanRepo, PreferenceRepo, StatRepo, UserRepo
+from src.repositories import (
+    CoachNoteRepo,
+    DailyCheckinRepo,
+    FoodRepo,
+    GoalRepo,
+    MealRepo,
+    PlanRepo,
+    PreferenceRepo,
+    StatRepo,
+    UserRepo,
+    WeightLogRepo,
+)
 from src.tg_files import download_telegram_file
 from src.models import User
 
@@ -1519,6 +1531,22 @@ def _looks_like_meal(text: str) -> bool:
     return False
 
 
+def _needs_hidden_calorie_clarification(user_text: str) -> list[str]:
+    t = _norm_text(user_text)
+    if not t:
+        return []
+    risky = any(k in t for k in ["жар", "гриль", "салат", "соус", "сыр", "орех", "майон", "шаур", "бургер", "пицц", "паста"])
+    if not risky:
+        return []
+    # if user already mentioned oil/sauce amounts, skip
+    if any(k in t for k in ["масло", "олив", "соус", "майон", "кетч", "алког", "пиво", "вино", "сыр "]):
+        return []
+    return [
+        "Сколько масла/соуса было в приготовлении? (пример: масло 10г / 1 ст.л.)",
+        "Был ли сыр/орехи/алкоголь вместе с этим? Если да — сколько примерно?",
+    ]
+
+
 def _parse_dt(s: str | None) -> dt.datetime | None:
     if not s or not isinstance(s, str):
         return None
@@ -1526,6 +1554,89 @@ def _parse_dt(s: str | None) -> dt.datetime | None:
         return dt.datetime.fromisoformat(s)
     except Exception:
         return None
+
+
+def _tz_from_prefs(prefs: dict[str, Any]) -> ZoneInfo:
+    tz_name = prefs.get("timezone") if isinstance(prefs.get("timezone"), str) else "Europe/Prague"
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return ZoneInfo("Europe/Prague")
+
+
+def _mean(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    return sum(xs) / len(xs)
+
+
+def compute_calibration_from_weights(
+    *,
+    weights: list[dict[str, Any]],
+    current_target_kcal: int,
+) -> dict[str, Any] | None:
+    """
+    weights: list of {date: 'YYYY-MM-DD', weight_kg: float} ascending.
+    Uses 7-day vs previous 7-day averages when possible.
+    """
+    ws = []
+    for w in weights:
+        try:
+            ws.append((dt.date.fromisoformat(w["date"]), float(w["weight_kg"])))
+        except Exception:
+            continue
+    if len(ws) < 10:
+        return None
+
+    # take last 14 days window
+    last_date = ws[-1][0]
+    start = last_date - dt.timedelta(days=13)
+    window = [(d, v) for d, v in ws if d >= start]
+    if len(window) < 10:
+        return None
+
+    # split by date into first 7 and last 7 (by actual dates)
+    first = [v for d, v in window if d <= start + dt.timedelta(days=6)]
+    second = [v for d, v in window if d > start + dt.timedelta(days=6)]
+    a1 = _mean(first)
+    a2 = _mean(second)
+    if a1 is None or a2 is None:
+        return None
+
+    actual_loss_kg = a1 - a2  # positive means losing
+    days = 7
+    # implied deficit (kcal/day) from weight change
+    implied_def = (actual_loss_kg * 7700.0) / float(days)
+    # calibrated tdee approx = intake + deficit; we only know intake target
+    calibrated_tdee = int(round(float(current_target_kcal) + implied_def))
+
+    return {
+        "window_start": start.isoformat(),
+        "window_end": last_date.isoformat(),
+        "avg_weight_prev7": round(a1, 2),
+        "avg_weight_last7": round(a2, 2),
+        "actual_loss_kg_per_week": round(actual_loss_kg, 2),
+        "implied_deficit_kcal_per_day": int(round(implied_def)),
+        "calibrated_tdee_kcal": calibrated_tdee,
+    }
+
+
+def _detect_weight_stall(weights: list[dict[str, Any]], days: int = 14) -> bool:
+    ws = []
+    for w in weights:
+        try:
+            ws.append((dt.date.fromisoformat(w["date"]), float(w["weight_kg"])))
+        except Exception:
+            continue
+    if len(ws) < 10:
+        return False
+    last_date = ws[-1][0]
+    start = last_date - dt.timedelta(days=days - 1)
+    window = [v for d, v in ws if d >= start]
+    if len(window) < 10:
+        return False
+    # stall if change < 0.2kg over window
+    return abs(window[-1] - window[0]) < 0.2
 
 
 async def _apply_coach_memory_if_needed(message: Message, *, pref_repo: PreferenceRepo, user: Any) -> bool:
@@ -1785,6 +1896,109 @@ async def _handle_recipe_ai(message: Message, *, user_repo: UserRepo, food_servi
     return True
 
 
+async def _handle_daily_checkin(message: Message, *, user_repo: UserRepo, user: Any, db: Any) -> bool:
+    if user.dialog_state != "daily_checkin":
+        return False
+    t0 = (message.text or "").strip()
+    if t0 in {"❌ Отмена", BTN_MENU, BTN_HELP}:
+        await user_repo.set_dialog(user, state=None, step=None, data=None)
+        await message.answer("Ок, отменил чек‑лист.", reply_markup=main_menu_kb())
+        return True
+
+    pref_repo = PreferenceRepo(db)
+    note_repo = CoachNoteRepo(db)
+    repo = DailyCheckinRepo(db)
+    prefs = await pref_repo.get_json(user.id)
+    tz = _tz_from_prefs(prefs)
+    today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+
+    try:
+        parsed = await text_json(
+            system=f"{SYSTEM_COACH}\n\n{DAILY_CHECKIN_JSON}",
+            user="Текст отчёта:\n" + t0,
+            max_output_tokens=350,
+        )
+    except Exception:
+        parsed = {}
+
+    def _b(x: Any) -> bool | None:
+        if isinstance(x, bool):
+            return x
+        return None
+
+    def _i(x: Any) -> int | None:
+        try:
+            if x is None:
+                return None
+            return int(float(x))
+        except Exception:
+            return None
+
+    def _f(x: Any) -> float | None:
+        try:
+            if x is None:
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    rec = await repo.upsert(
+        user_id=user.id,
+        date=today_local,
+        calories_ok=_b(parsed.get("calories_ok")),
+        protein_ok=_b(parsed.get("protein_ok")),
+        steps=_i(parsed.get("steps")),
+        sleep_hours=_f(parsed.get("sleep_hours")),
+        training_done=_b(parsed.get("training_done")),
+        alcohol=_b(parsed.get("alcohol")),
+        note_text=str(parsed.get("note") or "").strip() or None,
+        raw_json=parsed if isinstance(parsed, dict) else None,
+    )
+    try:
+        await note_repo.add_note(user_id=user.id, kind="daily_checkin", title="Дневной чек‑лист", note_json={"date": today_local.isoformat(), **(parsed if isinstance(parsed, dict) else {})})
+    except Exception:
+        pass
+
+    await user_repo.set_dialog(user, state=None, step=None, data=None)
+
+    # quick feedback (coach style)
+    lines = ["Принял чек‑лист."]
+    if rec.calories_ok is False:
+        lines.append("Калории не соблюдены — завтра держим структуру и убираем “лишнее” без наказаний.")
+    if rec.protein_ok is False:
+        lines.append("Белок не добран — завтра добьём (минимум +40–60г белка).")
+    if rec.alcohol is True:
+        lines.append("Алкоголь был — учти задержку воды/аппетит. Завтра без компенсаций, просто в норму.")
+    if rec.sleep_hours is not None and rec.sleep_hours < 7:
+        lines.append("Сон ниже 7ч — риск голода/срыва выше. Сегодня приоритет лечь раньше.")
+
+    await message.answer("\n".join(lines), reply_markup=main_menu_kb())
+
+    # if-then rules (simple, high-signal)
+    try:
+        # protein miss 2 days in a row -> actionable suggestion
+        last = await repo.last_days(user.id, days=3)
+        if len(last) >= 2 and last[-1].get("protein_ok") is False and last[-2].get("protein_ok") is False:
+            await note_repo.add_note(
+                user_id=user.id,
+                kind="rule_trigger",
+                title="Недобор белка 2 дня",
+                note_json={"rule": "protein_2_days", "last": last[-2:]},
+            )
+            await message.answer(
+                "Правило сработало: белок 2 дня подряд ниже цели.\n"
+                "Завтра сделай минимум одно:\n"
+                "- +300–400г skyr/йогурта\n"
+                "- или +250г творога\n"
+                "- или +200–250г курицы/индейки\n"
+                "Это проще, чем резать углеводы.",
+                reply_markup=main_menu_kb(),
+            )
+    except Exception:
+        pass
+    return True
+
+
 async def _checkin_loop(bot: Bot) -> None:
     """
     Background loop that periodically asks users for photo/measurements according to preferences.
@@ -1909,6 +2123,43 @@ async def _checkin_loop(bot: Bot) -> None:
                                 await db.commit()
                             except Exception:
                                 pass
+
+                    # daily discipline check-in (structured)
+                    if prefs.get("daily_checkin_enabled") is True:
+                        tstr = prefs.get("daily_checkin_time") if isinstance(prefs.get("daily_checkin_time"), str) else "21:30"
+                        days = prefs.get("daily_checkin_days") if prefs.get("daily_checkin_days") in {"weekdays", "weekends", "all"} else "all"
+                        if re.fullmatch(r"\d{2}:\d{2}", tstr):
+                            hh = int(tstr[:2])
+                            mm = int(tstr[3:5])
+                            wd = now_local.weekday()
+                            is_weekday = wd < 5
+                            if (days == "weekdays" and not is_weekday) or (days == "weekends" and is_weekday):
+                                pass
+                            else:
+                                last_date = prefs.get("last_daily_checkin_date")
+                                today_str = now_local.date().isoformat()
+                                if now_local.hour == hh and mm <= now_local.minute <= mm + 2 and last_date != today_str:
+                                    try:
+                                        # set dialog state for next user reply
+                                        u.dialog_state = "daily_checkin"
+                                        u.dialog_step = 0
+                                        u.dialog_data_json = dumps({"date": today_str})
+                                        await bot.send_message(
+                                            u.telegram_id,
+                                            "Дневной чек‑лист (ответь одним сообщением):\n"
+                                            "- калории: да/нет\n"
+                                            "- белок: да/нет\n"
+                                            "- шаги: число\n"
+                                            "- сон: часы\n"
+                                            "- тренировка: да/нет\n"
+                                            "- алкоголь: да/нет\n"
+                                            "Можно коротко: «ккал да, белок нет, шаги 9000, сон 7.5, трен да, алко нет».",
+                                            reply_markup=main_menu_kb(),
+                                        )
+                                        await pref_repo.merge(u.id, {"last_daily_checkin_date": today_str})
+                                        await db.commit()
+                                    except Exception:
+                                        pass
         except Exception:
             pass
 
@@ -2116,6 +2367,8 @@ async def cmd_week(message: Message) -> None:
         meal_repo = MealRepo(db)
         stat_repo = StatRepo(db)
         note_repo = CoachNoteRepo(db)
+        pref_repo = PreferenceRepo(db)
+        wrepo = WeightLogRepo(db)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
         if not user.profile_complete:
             await message.answer("Сначала заполним профиль: /start")
@@ -2179,6 +2432,31 @@ async def cmd_week(message: Message) -> None:
         except Exception:
             pass
 
+        # TDEE calibration (deterministic) based on weight trend; save to prefs + note
+        try:
+            prefs = await pref_repo.get_json(user.id)
+            weights = await wrepo.last_days(user.id, days=21)
+            if user.calories_target:
+                calib = compute_calibration_from_weights(weights=weights, current_target_kcal=int(user.calories_target))
+            else:
+                calib = None
+            if calib:
+                await pref_repo.merge(user.id, {"tdee_calibrated_kcal": calib["calibrated_tdee_kcal"], "tdee_calibration": calib})
+                await note_repo.add_note(user_id=user.id, kind="tdee_calibration", title="Калибровка TDEE по весу", note_json=calib)
+                await db.commit()
+                await message.answer(
+                    "Калибровка по динамике веса (реальные данные):\n"
+                    f"- средний вес (пред 7д): <b>{calib['avg_weight_prev7']} кг</b>\n"
+                    f"- средний вес (посл 7д): <b>{calib['avg_weight_last7']} кг</b>\n"
+                    f"- темп: <b>{calib['actual_loss_kg_per_week']} кг/нед</b>\n"
+                    f"- implied дефицит: <b>{calib['implied_deficit_kcal_per_day']} ккал/день</b>\n"
+                    f"- оценка TDEE: <b>{calib['calibrated_tdee_kcal']} ккал</b>\n\n"
+                    "Это не меняет калории автоматически — но теперь тренер будет опираться на эту оценку.",
+                    reply_markup=main_menu_kb(),
+                )
+        except Exception:
+            pass
+
         # persist weekly snapshot into stats
         avg_cal = int(round(sum(cals) / len(cals))) if cals else None
         await stat_repo.add_week_stat(
@@ -2209,6 +2487,11 @@ async def any_text(message: Message) -> None:
         food_repo = FoodRepo(db)
         food_service = FoodService(food_repo)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
+
+        handled = await _handle_daily_checkin(message, user_repo=user_repo, user=user, db=db)
+        if handled:
+            await db.commit()
+            return
 
         handled = await _handle_coach_onboarding(message, user_repo, user)
         if handled:
@@ -2379,6 +2662,16 @@ async def any_text(message: Message) -> None:
                 await message.answer("Вес числом (пример: 82.5).", reply_markup=main_menu_kb())
                 return
             user.weight_kg = float(w)
+            # persist daily weight log (local date by timezone)
+            try:
+                pref_repo = PreferenceRepo(db)
+                prefs = await pref_repo.get_json(user.id)
+                tz = _tz_from_prefs(prefs)
+                today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+                wrepo = WeightLogRepo(db)
+                await wrepo.upsert(user_id=user.id, date=today_local, weight_kg=float(w))
+            except Exception:
+                pass
             tr = compute_targets(
                 sex=user.sex,  # type: ignore[arg-type]
                 age=user.age,
@@ -2435,6 +2728,15 @@ async def any_text(message: Message) -> None:
         if action == "update_weight" and (route or {}).get("weight_kg") is not None:
             w = float(route.get("weight_kg"))
             user.weight_kg = float(w)
+            try:
+                pref_repo = PreferenceRepo(db)
+                prefs = await pref_repo.get_json(user.id)
+                tz = _tz_from_prefs(prefs)
+                today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+                wrepo = WeightLogRepo(db)
+                await wrepo.upsert(user_id=user.id, date=today_local, weight_kg=float(w))
+            except Exception:
+                pass
             t = compute_targets(
                 sex=user.sex,  # type: ignore[arg-type]
                 age=user.age,
@@ -2455,6 +2757,23 @@ async def any_text(message: Message) -> None:
                     title="Обновление веса",
                     note_json={"weight_kg": float(w), "calories_target": user.calories_target, "macros": {"p": t.protein_g, "f": t.fat_g, "c": t.carbs_g}},
                 )
+            except Exception:
+                pass
+            # stall detection
+            try:
+                wrepo = WeightLogRepo(db)
+                weights = await wrepo.last_days(user.id, days=21)
+                if _detect_weight_stall(weights, days=14) and (user.goal in {"loss", "recomp"}):
+                    await note_repo.add_note(user_id=user.id, kind="rule_trigger", title="Стоп веса 14 дней", note_json={"rule": "stall_14d", "weights": weights[-14:]})
+                    await message.answer(
+                        "Правило сработало: вес стоит ~14 дней.\n"
+                        "Выбирай один рычаг на 10 дней:\n"
+                        "- минус 150–200 ккал от нормы\n"
+                        "ИЛИ\n"
+                        "- +2500–3500 шагов/день.\n"
+                        "Напиши: «минус 200 ккал» или «+3000 шагов» — и я зафиксирую.",
+                        reply_markup=main_menu_kb(),
+                    )
             except Exception:
                 pass
             await db.commit()
@@ -2535,6 +2854,18 @@ async def any_text(message: Message) -> None:
                 )
                 await db.commit()
                 await message.answer(qs[0])
+                return
+        else:
+            extra_qs = _needs_hidden_calorie_clarification(meal_text)
+            if extra_qs:
+                await user_repo.set_dialog(
+                    user,
+                    state="meal_clarify",
+                    step=0,
+                    data={"draft": parsed, "questions": extra_qs, "answers": [], "source": "text"},
+                )
+                await db.commit()
+                await message.answer(extra_qs[0])
                 return
 
         draft2, unresolved_ctx = await _build_meal_from_items(items=parsed.get("items") or [], food_service=food_service)
