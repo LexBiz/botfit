@@ -296,30 +296,14 @@ async def _send_plans(
     shopping_lines: list[str] = []
     for (norm, store), grams in items_sorted[:25]:
         orig_name = display.get((norm, store), norm)
-        assets = await food_service.best_product_assets(orig_name, store=store)
-        img_url = assets.get("img_url")
-        off_url = assets.get("off_url")
-        store_url = assets.get("store_url") or make_store_search_url(store, orig_name)
-        best_name = assets.get("best_name")
-        brand = assets.get("brand")
-        search_query = assets.get("search_query")
+        # Speed/UX: user asked we can drop photo/OFF lookups. Keep only store search link + grams.
         display_name = orig_name
-        if isinstance(best_name, str) and best_name.strip():
-            display_name = best_name.strip()
-        if isinstance(brand, str) and brand.strip():
-            display_name = f"{brand.strip()} — {display_name}"
-        if _has_cyrillic_text(display_name):
-            sq = assets.get("search_query")
-            if isinstance(sq, str) and sq:
-                store_url = make_store_search_url(store, sq)
+        store_url = make_store_search_url(store, orig_name)
+        search_query = orig_name
         buy_hint = _suggest_buy(display_name, grams)
         links: list[str] = []
-        if isinstance(img_url, str) and img_url:
-            links.append(f"<a href=\"{img_url}\">📸 фото</a>")
         if isinstance(store_url, str) and store_url:
             links.append(f"<a href=\"{store_url}\">🛒 {store}</a>")
-        if isinstance(off_url, str) and off_url:
-            links.append(f"<a href=\"{off_url}\">🔎 OFF</a>")
         q_hint = f" 🔎 запрос: <code>{search_query}</code>" if isinstance(search_query, str) and search_query else ""
         shopping_lines.append(f"- <b>{display_name}</b> — {grams:.0f} г ({store}). {buy_hint}. " + " | ".join(links) + q_hint)
 
