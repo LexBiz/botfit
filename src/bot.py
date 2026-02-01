@@ -5,6 +5,7 @@ import datetime as dt
 import math
 import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
@@ -763,12 +764,26 @@ async def _start_meal_confirm(
     items = draft.get("items") or []
     totals = draft.get("totals") or {}
     tbl = recipe_table(items)
+    per100 = ""
+    try:
+        tw = float(totals.get("total_weight_g") or 0)
+        if source == "recipe" and tw > 0:
+            per100 = (
+                f"\nНа 100г: "
+                f"{(float(totals.get('calories') or 0) / tw * 100):.0f} ккал, "
+                f"Б {(float(totals.get('protein_g') or 0) / tw * 100):.1f} / "
+                f"Ж {(float(totals.get('fat_g') or 0) / tw * 100):.1f} / "
+                f"У {(float(totals.get('carbs_g') or 0) / tw * 100):.1f}"
+            )
+    except Exception:
+        per100 = ""
     text = (
-        "Я распознал так (оценка):\n"
-        f"<pre>{tbl}</pre>\n"
-        f"Итого: {totals.get('total_weight_g')} г, {totals.get('calories')} ккал, "
-        f"Б {totals.get('protein_g')} / Ж {totals.get('fat_g')} / У {totals.get('carbs_g')}\n\n"
-        "Подтвердить и внести в дневник? (да/нет)"
+        ("Я распознал рецепт так (оценка):\n" if source == "recipe" else "Я распознал так (оценка):\n")
+        + f"<pre>{tbl}</pre>\n"
+        + f"Итого: {totals.get('total_weight_g')} г, {totals.get('calories')} ккал, "
+        + f"Б {totals.get('protein_g')} / Ж {totals.get('fat_g')} / У {totals.get('carbs_g')}"
+        + f"{per100}\n\n"
+        + "Подтвердить и внести в дневник? (да/нет)"
     )
     await message.answer(text)
 
@@ -1389,6 +1404,12 @@ async def _apply_coach_memory_if_needed(message: Message, *, pref_repo: Preferen
         merged_patch["checkin_every_days"] = int(patch["checkin_every_days"])
     if isinstance(patch.get("checkin_ask"), dict):
         merged_patch["checkin_ask"] = patch["checkin_ask"]
+    if isinstance(patch.get("weight_prompt_enabled"), bool):
+        merged_patch["weight_prompt_enabled"] = bool(patch["weight_prompt_enabled"])
+    if isinstance(patch.get("weight_prompt_time"), str) and re.fullmatch(r"\d{2}:\d{2}", patch["weight_prompt_time"].strip()):
+        merged_patch["weight_prompt_time"] = patch["weight_prompt_time"].strip()
+    if patch.get("weight_prompt_days") in {"weekdays", "weekends", "all"}:
+        merged_patch["weight_prompt_days"] = patch["weight_prompt_days"]
     if isinstance(patch.get("notes"), str) and patch.get("notes"):
         merged_patch["notes"] = str(patch["notes"]).strip()
 
@@ -1543,6 +1564,43 @@ async def _handle_coach_chat(
     return True
 
 
+async def _handle_recipe_ai(message: Message, *, user_repo: UserRepo, food_service: FoodService, user: Any, text: str) -> bool:
+    """
+    Free-form recipe -> items(grams) -> macros via OpenFoodFacts.
+    Saved via existing meal_confirm flow, source="recipe".
+    """
+    try:
+        parsed = await text_json(
+            system=f"{SYSTEM_COACH}\n\n{MEAL_ITEMS_JSON}",
+            user=_profile_context(user) + "\nЭто рецепт. Выдели ингредиенты и граммовки:\n" + text,
+            max_output_tokens=750,
+        )
+    except Exception as e:
+        await message.answer(f"Не смог разобрать рецепт (ошибка): {e}")
+        return True
+
+    if parsed.get("needs_clarification"):
+        qs = parsed.get("clarifying_questions") or []
+        if qs:
+            await user_repo.set_dialog(
+                user,
+                state="meal_clarify",
+                step=0,
+                data={"draft": parsed, "questions": qs, "answers": [], "source": "recipe"},
+            )
+            await message.answer(qs[0])
+            return True
+
+    draft2, unresolved_ctx = await _build_meal_from_items(items=parsed.get("items") or [], food_service=food_service)
+    if unresolved_ctx:
+        await user_repo.set_dialog(user, state="food_pick", step=0, data={"ctx": unresolved_ctx, "source": "recipe"})
+        await message.answer(_format_food_pick_question(unresolved_ctx, 0))
+        return True
+
+    await _start_meal_confirm(message, user_repo, user, draft2 or {}, source="recipe")
+    return True
+
+
 async def _checkin_loop(bot: Bot) -> None:
     """
     Background loop that periodically asks users for photo/measurements according to preferences.
@@ -1554,40 +1612,78 @@ async def _checkin_loop(bot: Bot) -> None:
                 # list users
                 res = await db.execute(select(User).where(User.profile_complete == True))  # noqa: E712
                 users = list(res.scalars().all())
-                now = _utcnow_naive()
+                now_utc = dt.datetime.now(dt.timezone.utc)
 
                 for u in users:
                     prefs = await pref_repo.get_json(u.id)
+
+                    tz_name = prefs.get("timezone") if isinstance(prefs.get("timezone"), str) else "Europe/Prague"
+                    try:
+                        tz = ZoneInfo(tz_name)
+                    except Exception:
+                        tz = ZoneInfo("Europe/Prague")
+                    now_local = now_utc.astimezone(tz)
+
                     every = prefs.get("checkin_every_days")
                     if not isinstance(every, (int, float)) or every <= 0:
-                        continue
+                        every = None
 
-                    last = _parse_dt(prefs.get("last_checkin_request_utc"))
-                    if last and (now - last) < dt.timedelta(days=float(every)):
-                        continue
+                    if every is not None:
+                        last = _parse_dt(prefs.get("last_checkin_request_utc"))
+                        if last:
+                            last_utc = last.replace(tzinfo=dt.timezone.utc)
+                        else:
+                            last_utc = None
+                        if last_utc and (now_utc - last_utc) < dt.timedelta(days=float(every)):
+                            pass
+                        else:
+                            ask = prefs.get("checkin_ask") or {}
+                            want_photo = bool(ask.get("photo", True))
+                            want_meas = bool(ask.get("measurements", True))
+                            parts = ["Проверка прогресса:"]
+                            if want_photo:
+                                parts.append("- пришли фото (фронт/бок/спина) при одинаковом свете")
+                            if want_meas:
+                                parts.append("- и замеры: талия/бедра/грудь (см)")
+                            parts.append("Если хочешь отключить — напиши: «отмени чек-ин».")
+                            text = "\n".join(parts)
 
-                    ask = prefs.get("checkin_ask") or {}
-                    want_photo = bool(ask.get("photo", True))
-                    want_meas = bool(ask.get("measurements", True))
-                    parts = ["Проверка прогресса:"]
-                    if want_photo:
-                        parts.append("- пришли фото (фронт/бок/спина) при одинаковом свете")
-                    if want_meas:
-                        parts.append("- и замеры: талия/бедра/грудь (см)")
-                    parts.append("Если хочешь отключить — напиши: «не проси фото/замеры» или «отмени чек-ин».")
-                    text = "\n".join(parts)
+                            try:
+                                await bot.send_message(u.telegram_id, text, reply_markup=main_menu_kb())
+                                await pref_repo.merge(u.id, {"last_checkin_request_utc": now_utc.isoformat()})
+                                await db.commit()
+                            except Exception:
+                                pass
 
-                    try:
-                        await bot.send_message(u.telegram_id, text, reply_markup=main_menu_kb())
-                        await pref_repo.merge(u.id, {"last_checkin_request_utc": now.isoformat()})
-                        await db.commit()
-                    except Exception:
-                        # ignore delivery errors (blocked bot etc.)
-                        continue
+                    # daily weight prompt (time-based)
+                    if prefs.get("weight_prompt_enabled") is True:
+                        tstr = prefs.get("weight_prompt_time") if isinstance(prefs.get("weight_prompt_time"), str) else "06:00"
+                        days = prefs.get("weight_prompt_days") if prefs.get("weight_prompt_days") in {"weekdays", "weekends", "all"} else "all"
+                        if re.fullmatch(r"\d{2}:\d{2}", tstr):
+                            hh = int(tstr[:2])
+                            mm = int(tstr[3:5])
+                            wd = now_local.weekday()  # 0=Mon
+                            is_weekday = wd < 5
+                            if (days == "weekdays" and not is_weekday) or (days == "weekends" and is_weekday):
+                                pass
+                            else:
+                                last_date = prefs.get("last_weight_prompt_date")
+                                today_str = now_local.date().isoformat()
+                                if now_local.hour == hh and mm <= now_local.minute <= mm + 2 and last_date != today_str:
+                                    try:
+                                        await bot.send_message(
+                                            u.telegram_id,
+                                            "Доброе утро. Пришли текущий вес (кг).",
+                                            reply_markup=main_menu_kb(),
+                                        )
+                                        await pref_repo.merge(u.id, {"last_weight_prompt_date": today_str})
+                                        await db.commit()
+                                    except Exception:
+                                        pass
         except Exception:
             pass
 
-        await asyncio.sleep(60 * 30)
+        await asyncio.sleep(60)
 
 
 @router.message(Command("plan"))
@@ -2060,6 +2156,11 @@ async def any_text(message: Message) -> None:
             pref_repo = PreferenceRepo(db)
             plan_repo = PlanRepo(db)
             handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, user=user)
+            if handled:
+                await db.commit()
+                return
+        if action == "recipe_ai":
+            handled = await _handle_recipe_ai(message, user_repo=user_repo, food_service=food_service, user=user, text=(route or {}).get("meal_text") or user_text)
             if handled:
                 await db.commit()
                 return

@@ -177,7 +177,7 @@ ROUTER_JSON = """
 
 Формат:
 {
-  "action": "log_meal" | "plan_day" | "analyze_week" | "update_weight" | "show_profile" | "help" | "update_prefs" | "recall_plan" | "coach_chat" | "unknown",
+  "action": "log_meal" | "plan_day" | "analyze_week" | "update_weight" | "show_profile" | "help" | "update_prefs" | "recall_plan" | "recipe_ai" | "coach_chat" | "unknown",
   "meal_text": string | null,
   "weight_kg": number | null,
   "note": string | null
@@ -185,6 +185,7 @@ ROUTER_JSON = """
 
 Правила:
 - Если сообщение похоже на описание еды/приема пищи/ингредиентов — action="log_meal" и meal_text=исходный текст.
+- Если пользователь просит посчитать рецепт/ингредиенты/«2 ч.л масла + 4 крыла»/«рассчитай на 100г» — action="recipe_ai" и meal_text=исходный текст.
 - Если пользователь просит составить рацион/меню на день — action="plan_day".
 - Если пользователь просит напомнить/показать/повторить рацион или «что у меня на завтрак/обед/ужин сегодня» — action="recall_plan" и note="breakfast|lunch|dinner|snack|today".
 - Если просит анализ дневника за неделю/7 дней — action="analyze_week".
@@ -211,6 +212,9 @@ COACH_MEMORY_JSON = """
     "supplements": [string, ...] | null,
     "checkin_every_days": number | null,
     "checkin_ask": {"photo": boolean, "measurements": boolean} | null,
+    "weight_prompt_enabled": boolean | null,
+    "weight_prompt_time": string | null,
+    "weight_prompt_days": "weekdays" | "all" | "weekends" | null,
     "notes": string | null
   },
   "ack": string | null,
@@ -221,6 +225,9 @@ COACH_MEMORY_JSON = """
 - Если сообщение НЕ про сохранение правил/привычек/настроек — should_apply=false.
 - Если пользователь говорит «каждые 3 дня проси фото и замеры» -> checkin_every_days=3, checkin_ask photo=true measurements=true.
 - Если «в 9 утра перекус по будням» -> snack_rules=[{"days":"weekdays","time":"09:00","text":"перекус"}].
+- Если «каждый день в 6 утра запрашивай вес» -> weight_prompt_enabled=true, weight_prompt_time="06:00", weight_prompt_days="all".
+- Если «по будням в 6 утра вес» -> weight_prompt_days="weekdays".
+- Если «не спрашивай вес/отмени запрос веса» -> weight_prompt_enabled=false.
 - supplements: если «принимаю спортпит/креатин/протеин» — добавь в список (без дозировок, если их нет).
 - ack: короткое подтверждение, что сохранено (1-2 строки).
 """.strip()
