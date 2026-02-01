@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import math
 import re
 from typing import Any
 
@@ -1098,41 +1099,110 @@ async def cmd_plan(message: Message) -> None:
 
     async with SessionLocal() as db:
         user_repo = UserRepo(db)
-        plan_repo = PlanRepo(db)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
         if not user.profile_complete:
             await message.answer("Сначала заполним профиль: /start")
             return
 
-        try:
+        days = 1
+        if message.text:
+            parts = message.text.strip().split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                days = max(1, min(int(parts[1]), 7))
+
+        await _generate_plan_for_days(message, db=db, user=user, days=days)
+        return
+
+
+async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int) -> None:
+    plan_repo = PlanRepo(db)
+    food_service = FoodService(FoodRepo(db))
+    start_date = dt.date.today()
+    try:
+        day_plans: list[dict[str, Any]] = []
+        for i in range(days):
+            d = start_date + dt.timedelta(days=i)
             plan = await text_json(
                 system=f"{SYSTEM_NUTRITIONIST}\n\n{DAY_PLAN_JSON}",
-                user=_profile_context(user) + f"\nСоставь рацион на день на {user.calories_target} ккал.",
+                user=_profile_context(user) + f"\nСоставь рацион на {d.isoformat()} на {user.calories_target} ккал.",
                 max_output_tokens=1400,
             )
-        except Exception:
-            # Safe fallback: return plain text plan instead of failing.
-            plan_text = await text_output(
-                system=SYSTEM_NUTRITIONIST
-                + "\nСоставь рацион на день для Чехии (Lidl/Kaufland/Albert) с граммовками, рецептами и КБЖУ. Пиши структурировано.",
-                user=_profile_context(user) + f"\nНорма: {user.calories_target} ккал. Составь рацион на день.",
-                max_output_tokens=1400,
-            )
-            await message.answer(plan_text[:3900], reply_markup=main_menu_kb())
-            return
+            day_plans.append(plan)
+    except Exception:
+        # Safe fallback: return plain text plan instead of failing.
+        plan_text = await text_output(
+            system=SYSTEM_NUTRITIONIST
+            + "\nСоставь рацион на день для Чехии (Lidl/Kaufland/Albert) с граммовками, рецептами и КБЖУ. Пиши структурировано.",
+            user=_profile_context(user) + f"\nНорма: {user.calories_target} ккал. Составь рацион на день.",
+            max_output_tokens=1400,
+        )
+        await message.answer(plan_text[:3900], reply_markup=main_menu_kb())
+        return
 
-        meals = plan.get("meals") or []
-        totals = plan.get("totals") or {}
-
+    # persist plans
+    for i, plan in enumerate(day_plans):
         await plan_repo.upsert_day_plan(
             user_id=user.id,
-            date=dt.date.today(),
+            date=start_date + dt.timedelta(days=i),
             calories_target=user.calories_target,
             plan=plan,
         )
-        await db.commit()
+    await db.commit()
 
-        parts = ["Рацион на день:"]
+    def _norm_name(n: str) -> str:
+        return re.sub(r"\s+", " ", n.strip().lower())
+
+    def _suggest_buy(name: str, grams: float) -> str:
+        n = _norm_name(name)
+        g = max(float(grams), 0.0)
+        # very simple heuristics, labeled as estimate
+        if "яйц" in n:
+            pcs = max(1, int(math.ceil(g / 60.0)))
+            packs = int(math.ceil(pcs / 10.0))
+            return f"Купить: ~{packs}×10 шт (нужно ~{pcs} шт)"
+        step = 100.0
+        if any(k in n for k in ["рис", "паст", "овся", "греч", "мук", "круп", "макарон"]):
+            step = 500.0
+        elif any(k in n for k in ["кур", "индей", "говя", "свини", "рыб", "лосос", "тунец"]):
+            step = 500.0
+        elif any(k in n for k in ["йогур", "творог", "скыр", "сыр", "молок", "кефир"]):
+            step = 200.0
+        buy = int(math.ceil(g / step) * step)
+        packs = int(math.ceil(g / step))
+        return f"Купить: ~{buy:.0f} г ({packs}×{step:.0f} г) — ориентир"
+
+    # aggregate shopping list across days
+    agg: dict[tuple[str, str], float] = {}
+    display: dict[tuple[str, str], str] = {}
+    for plan in day_plans:
+        for it in (plan.get("shopping_list") or []):
+            name = str(it.get("name") or "").strip()
+            store = str(it.get("store") or "").strip() or "Lidl"
+            grams = float(it.get("grams") or 0)
+            if not name or grams <= 0:
+                continue
+            key = (_norm_name(name), store)
+            agg[key] = agg.get(key, 0.0) + grams
+            display.setdefault(key, name)
+
+    # enrich with images (limit to avoid slow)
+    items_sorted = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
+    shopping_lines: list[str] = []
+    for (norm, store), grams in items_sorted[:25]:
+        display_name = display.get((norm, store), norm)
+        img_url = await food_service.best_image_url(display_name)
+        buy_hint = _suggest_buy(display_name, grams)
+        shopping_lines.append(
+            f"- <b>{display_name}</b> — {grams:.0f} г ({store}). {buy_hint}. "
+            f"<a href=\"{img_url}\">фото</a>"
+        )
+
+    parts: list[str] = [f"<b>Рацион на {days} дн.</b>"]
+    for di, plan in enumerate(day_plans):
+        d = start_date + dt.timedelta(days=di)
+        meals = plan.get("meals") or []
+        totals = plan.get("totals") or {}
+        parts.append(f"\n<b>День {di+1} — {d.isoformat()}</b>")
         for i, m in enumerate(meals, start=1):
             parts.append(
                 f"\n<b>{i}. {m.get('title')}</b>\n"
@@ -1143,9 +1213,13 @@ async def cmd_plan(message: Message) -> None:
                 + "\n".join([f"- {s}" for s in (m.get('recipe') or [])])
             )
         parts.append(
-            f"\n<b>Итого</b>: {totals.get('kcal')} ккал | Б {totals.get('protein_g')} | Ж {totals.get('fat_g')} | У {totals.get('carbs_g')}"
+            f"\n<b>Итого дня</b>: {totals.get('kcal')} ккал | Б {totals.get('protein_g')} | Ж {totals.get('fat_g')} | У {totals.get('carbs_g')}"
         )
-        await message.answer("\n".join(parts))
+
+    if shopping_lines:
+        parts.append("\n<b>Список покупок (суммарно)</b>:\n" + "\n".join(shopping_lines))
+
+    await message.answer("\n".join(parts)[:3900], reply_markup=main_menu_kb())
 
 
 @router.message(Command("recipe"))
@@ -1337,7 +1411,9 @@ async def any_text(message: Message) -> None:
             await cmd_profile(message)
             return
         if t in {BTN_PLAN}:
-            await cmd_plan(message)
+            await user_repo.set_dialog(user, state="plan_days", step=0, data=None)
+            await db.commit()
+            await message.answer("На сколько дней сделать рацион? (1-7). Можно просто цифрой.", reply_markup=main_menu_kb())
             return
         if t in {BTN_WEEK}:
             await cmd_week(message)
@@ -1386,6 +1462,17 @@ async def any_text(message: Message) -> None:
                 f"Новая норма: <b>{tr.calories} ккал</b>, БЖУ: <b>{tr.protein_g}/{tr.fat_g}/{tr.carbs_g} г</b>",
                 reply_markup=main_menu_kb(),
             )
+            return
+
+        # plan_days dialog
+        if user.dialog_state == "plan_days":
+            n = _parse_int(t)
+            if n is None or not (1 <= n <= 7):
+                await message.answer("Напиши число от 1 до 7.", reply_markup=main_menu_kb())
+                return
+            await user_repo.set_dialog(user, state=None, step=None, data=None)
+            await db.commit()
+            await _generate_plan_for_days(message, db=db, user=user, days=n)
             return
 
         # Agent router (free-form commands)

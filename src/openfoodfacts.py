@@ -18,6 +18,7 @@ class FoodCandidate:
     protein_100g: float | None
     fat_100g: float | None
     carbs_100g: float | None
+    image_url: str | None
     raw: dict[str, Any]
 
 
@@ -42,7 +43,7 @@ def _nutrients_from_product(prod: dict[str, Any]) -> tuple[float | None, float |
 async def get_by_barcode(barcode: str) -> FoodCandidate | None:
     base = settings.off_base_url.rstrip("/")
     url = f"{base}/api/v2/product/{barcode}.json"
-    params = {"fields": "code,product_name,brands,nutriments"}
+    params = {"fields": "code,product_name,brands,nutriments,image_front_url,image_url"}
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
@@ -62,6 +63,7 @@ async def get_by_barcode(barcode: str) -> FoodCandidate | None:
         protein_100g=p,
         fat_100g=fat,
         carbs_100g=carbs,
+        image_url=(str(prod.get("image_front_url") or prod.get("image_url") or "").strip() or None),
         raw=prod,
     )
 
@@ -76,7 +78,7 @@ async def search(query: str, *, page_size: int | None = None) -> list[FoodCandid
         "action": "process",
         "json": 1,
         "page_size": ps,
-        "fields": "code,product_name,brands,nutriments",
+        "fields": "code,product_name,brands,nutriments,image_front_url,image_url",
         # region hint
         "cc": settings.off_country.lower(),
     }
@@ -103,8 +105,17 @@ async def search(query: str, *, page_size: int | None = None) -> list[FoodCandid
                 protein_100g=p,
                 fat_100g=fat,
                 carbs_100g=carbs,
+                image_url=(str(prod.get("image_front_url") or prod.get("image_url") or "").strip() or None),
                 raw=prod,
             )
         )
     return out
+
+
+def make_search_url(query: str) -> str:
+    base = settings.off_base_url.rstrip("/")
+    from urllib.parse import quote_plus
+
+    q = quote_plus(query)
+    return f"{base}/cgi/search.pl?search_terms={q}&search_simple=1&action=process"
 

@@ -4,7 +4,7 @@ from dataclasses import asdict
 from typing import Any
 
 from src.jsonutil import dumps, loads
-from src.openfoodfacts import FoodCandidate, get_by_barcode, search
+from src.openfoodfacts import FoodCandidate, get_by_barcode, make_search_url, search
 from src.repositories import FoodRepo
 
 
@@ -25,6 +25,7 @@ class FoodService:
                 protein_100g=nutr.get("protein_100g"),
                 fat_100g=nutr.get("fat_100g"),
                 carbs_100g=nutr.get("carbs_100g"),
+                image_url=nutr.get("image_url"),
                 raw=nutr.get("raw") or {},
             )
 
@@ -43,6 +44,7 @@ class FoodService:
                     "protein_100g": cand.protein_100g,
                     "fat_100g": cand.fat_100g,
                     "carbs_100g": cand.carbs_100g,
+                    "image_url": cand.image_url,
                     "raw": cand.raw,
                 }
             ),
@@ -65,11 +67,19 @@ class FoodService:
                             "protein_100g": c.protein_100g,
                             "fat_100g": c.fat_100g,
                             "carbs_100g": c.carbs_100g,
+                            "image_url": c.image_url,
                             "raw": c.raw,
                         }
                     ),
                 )
         return cands
+
+    async def best_image_url(self, query: str) -> str:
+        cands = await self.search(query)
+        for c in cands:
+            if c.image_url:
+                return c.image_url
+        return make_search_url(query)
 
 
 def compute_item_macros(*, grams: float, cand: FoodCandidate) -> dict[str, Any] | None:
@@ -87,6 +97,7 @@ def compute_item_macros(*, grams: float, cand: FoodCandidate) -> dict[str, Any] 
         "protein_g": float(cand.protein_100g) * factor,
         "fat_g": float(cand.fat_100g) * factor,
         "carbs_g": float(cand.carbs_100g) * factor,
+        "image_url": cand.image_url,
         "per_100g": {
             "kcal": cand.kcal_100g,
             "protein_g": cand.protein_100g,
