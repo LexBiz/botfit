@@ -215,6 +215,9 @@ COACH_MEMORY_JSON = """
     "weight_prompt_enabled": boolean | null,
     "weight_prompt_time": string | null,
     "weight_prompt_days": "weekdays" | "all" | "weekends" | null,
+    "reminders": [
+      {"time": "HH:MM", "days": "weekdays" | "all" | "weekends", "text": string}
+    ] | null,
     "notes": string | null
   },
   "ack": string | null,
@@ -228,8 +231,26 @@ COACH_MEMORY_JSON = """
 - Если «каждый день в 6 утра запрашивай вес» -> weight_prompt_enabled=true, weight_prompt_time="06:00", weight_prompt_days="all".
 - Если «по будням в 6 утра вес» -> weight_prompt_days="weekdays".
 - Если «не спрашивай вес/отмени запрос веса» -> weight_prompt_enabled=false.
+- reminders: если пользователь просит напоминания/вопросы по времени ("в 21:30 спроси как прошел день") — заполни массив reminders.
+- Если пользователь просит отключить напоминания ("отмени напоминания") — верни reminders=[] и should_apply=true.
 - supplements: если «принимаю спортпит/креатин/протеин» — добавь в список (без дозировок, если их нет).
 - ack: короткое подтверждение, что сохранено (1-2 строки).
+""".strip()
+
+
+PROGRESS_PHOTO_JSON = """
+Верни строго JSON (без текста вокруг). Задача: кратко описать прогресс-фото для сравнения в будущем.
+Формат:
+{
+  "summary": string,
+  "visible_changes": [string, ...],
+  "next_actions": [string, ...],
+  "confidence": "low" | "medium" | "high"
+}
+Правила:
+- Не идентифицируй личность. Не делай медицинских диагнозов.
+- Сфокусируйся на наблюдаемом: осанка, объемы, талия/плечи/спина, общий вид.
+- Если фото непригодно (плохой свет/угол) — confidence="low" и напиши что улучшить.
 """.strip()
 
 

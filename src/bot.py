@@ -27,6 +27,7 @@ from src.prompts import (
     COACH_ONBOARD_JSON,
     COACH_MEMORY_JSON,
     COACH_CHAT_GUIDE,
+    PROGRESS_PHOTO_JSON,
     DAY_PLAN_JSON,
     MEAL_ITEMS_JSON,
     MEAL_FROM_PHOTO_FINAL_JSON,
@@ -46,7 +47,8 @@ from src.keyboards import (
     BTN_PHOTO_HELP,
     BTN_PLAN,
     BTN_PROFILE,
-    BTN_RECIPE,
+    BTN_PROGRESS,
+    BTN_REMINDERS,
     BTN_WEEK,
     BTN_WEIGHT,
     goal_tempo_kb,
@@ -980,7 +982,8 @@ async def _handle_food_pick(message: Message, user_repo: UserRepo, food_service:
         BTN_PHOTO_HELP,
         BTN_PLAN,
         BTN_WEEK,
-        BTN_RECIPE,
+        BTN_REMINDERS,
+        BTN_PROGRESS,
     }:
         await user_repo.set_dialog(user, state=None, step=None, data=None)
         await message.answer("Ок, отменил выбор продукта.", reply_markup=main_menu_kb())
@@ -1083,12 +1086,43 @@ async def photo_message(message: Message, bot: Bot) -> None:
 
     async with SessionLocal() as db:
         user_repo = UserRepo(db)
+        note_repo = CoachNoteRepo(db)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
         if not user.profile_complete:
             await message.answer("Сначала заполним профиль: /start")
             return
 
         photo = message.photo[-1]
+        caption = (message.caption or "").strip()
+        if user.dialog_state == "progress_mode" or "прогресс" in _norm_text(caption):
+            # progress photo (not food)
+            try:
+                image_bytes = await download_telegram_file(bot, photo.file_id)
+                analysis = await vision_json(
+                    system=f"{SYSTEM_COACH}\n\n{PROGRESS_PHOTO_JSON}",
+                    user_text="Это фото прогресса тела. Дай краткий разбор для сравнения.",
+                    image_bytes=image_bytes,
+                    image_mime="image/jpeg",
+                    max_output_tokens=700,
+                )
+            except Exception:
+                analysis = {"summary": "Сохранил фото прогресса (без анализа).", "visible_changes": [], "next_actions": [], "confidence": "low"}
+
+            try:
+                await note_repo.add_note(
+                    user_id=user.id,
+                    kind="progress_photo",
+                    title="Фото прогресса",
+                    note_json={"photo_file_id": photo.file_id, "analysis": analysis, "caption": caption},
+                )
+                await db.commit()
+            except Exception:
+                pass
+
+            msg = str((analysis or {}).get("summary") or "Сохранил фото прогресса.")
+            await message.answer(msg + "\n\nНапиши «сравни», чтобы я сопоставил последние фото/замеры.", reply_markup=main_menu_kb())
+            return
+
         try:
             image_bytes = await download_telegram_file(bot, photo.file_id)
             analysis = await vision_json(
@@ -1226,7 +1260,8 @@ async def _handle_photo_clarify(
         BTN_PHOTO_HELP,
         BTN_PLAN,
         BTN_WEEK,
-        BTN_RECIPE,
+        BTN_REMINDERS,
+        BTN_PROGRESS,
     }:
         await user_repo.set_dialog(user, state=None, step=None, data=None)
         await message.answer("Ок, отменил разбор фото.", reply_markup=main_menu_kb())
@@ -1305,7 +1340,8 @@ async def _handle_meal_confirm(message: Message, user_repo: UserRepo, meal_repo:
         BTN_PHOTO_HELP,
         BTN_PLAN,
         BTN_WEEK,
-        BTN_RECIPE,
+        BTN_REMINDERS,
+        BTN_PROGRESS,
     }:
         await user_repo.set_dialog(user, state=None, step=None, data=None)
         await message.answer("Ок, отменил подтверждение.", reply_markup=main_menu_kb())
@@ -1350,7 +1386,8 @@ async def _handle_meal_clarify(message: Message, user_repo: UserRepo, food_servi
         BTN_PHOTO_HELP,
         BTN_PLAN,
         BTN_WEEK,
-        BTN_RECIPE,
+        BTN_REMINDERS,
+        BTN_PROGRESS,
     }:
         await user_repo.set_dialog(user, state=None, step=None, data=None)
         await message.answer("Ок, отменил уточнения по приёму пищи.", reply_markup=main_menu_kb())
@@ -1412,7 +1449,8 @@ async def _handle_apply_calories(message: Message, user_repo: UserRepo, user: An
         BTN_PHOTO_HELP,
         BTN_PLAN,
         BTN_WEEK,
-        BTN_RECIPE,
+        BTN_REMINDERS,
+        BTN_PROGRESS,
     }:
         await user_repo.set_dialog(user, state=None, step=None, data=None)
         await message.answer("Ок, не применяю изменения.", reply_markup=main_menu_kb())
@@ -1531,6 +1569,17 @@ async def _apply_coach_memory_if_needed(message: Message, *, pref_repo: Preferen
         merged_patch["weight_prompt_time"] = patch["weight_prompt_time"].strip()
     if patch.get("weight_prompt_days") in {"weekdays", "weekends", "all"}:
         merged_patch["weight_prompt_days"] = patch["weight_prompt_days"]
+    if isinstance(patch.get("reminders"), list):
+        rems: list[dict[str, Any]] = []
+        for r in patch.get("reminders")[:20]:
+            if not isinstance(r, dict):
+                continue
+            t = r.get("time")
+            d = r.get("days")
+            txt = r.get("text")
+            if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip()) and d in {"weekdays", "weekends", "all"} and isinstance(txt, str) and txt.strip():
+                rems.append({"time": t.strip(), "days": d, "text": txt.strip()})
+        merged_patch["reminders"] = rems
     if isinstance(patch.get("notes"), str) and patch.get("notes"):
         merged_patch["notes"] = str(patch["notes"]).strip()
 
@@ -1815,6 +1864,51 @@ async def _checkin_loop(bot: Bot) -> None:
                                         await db.commit()
                                     except Exception:
                                         pass
+
+                    # generic reminders (time-based)
+                    rems = prefs.get("reminders")
+                    if isinstance(rems, list) and rems:
+                        last_sent = prefs.get("reminders_last_sent")
+                        last_sent = last_sent if isinstance(last_sent, dict) else {}
+                        updated_last: dict[str, Any] | None = None
+
+                        for idx, r in enumerate(rems[:20]):
+                            if not isinstance(r, dict):
+                                continue
+                            tstr = r.get("time")
+                            days = r.get("days")
+                            text = r.get("text")
+                            if not (isinstance(tstr, str) and re.fullmatch(r"\d{2}:\d{2}", tstr.strip())):
+                                continue
+                            if days not in {"weekdays", "weekends", "all"}:
+                                continue
+                            if not isinstance(text, str) or not text.strip():
+                                continue
+
+                            hh = int(tstr[:2])
+                            mm = int(tstr[3:5])
+                            wd = now_local.weekday()
+                            is_weekday = wd < 5
+                            if (days == "weekdays" and not is_weekday) or (days == "weekends" and is_weekday):
+                                continue
+
+                            rid = f"r{idx}"
+                            today_str = now_local.date().isoformat()
+                            if now_local.hour == hh and mm <= now_local.minute <= mm + 2 and last_sent.get(rid) != today_str:
+                                try:
+                                    await bot.send_message(u.telegram_id, str(text).strip(), reply_markup=main_menu_kb())
+                                    if updated_last is None:
+                                        updated_last = dict(last_sent)
+                                    updated_last[rid] = today_str
+                                except Exception:
+                                    pass
+
+                        if updated_last is not None:
+                            try:
+                                await pref_repo.merge(u.id, {"reminders_last_sent": updated_last})
+                                await db.commit()
+                            except Exception:
+                                pass
         except Exception:
             pass
 
@@ -2192,9 +2286,29 @@ async def any_text(message: Message) -> None:
         if t in {BTN_WEEK}:
             await cmd_week(message)
             return
-        if t in {BTN_RECIPE}:
+        if t in {BTN_REMINDERS}:
+            await user_repo.set_dialog(user, state="reminders_setup", step=0, data=None)
+            await db.commit()
             await message.answer(
-                "Пришли ингредиенты строками (как в /recipe), и я посчитаю итог и на 100г.",
+                "Ок. Опиши напоминания одним сообщением.\n"
+                "Примеры:\n"
+                "- «каждый день в 06:00 спроси вес»\n"
+                "- «в 09:00 по будням перекус»\n"
+                "- «в 21:30 спроси, как прошёл день и соблюдал ли калории»\n"
+                "- «каждые 3 дня попроси фото и замеры»\n\n"
+                "Чтобы отменить — напиши: ❌ Отмена",
+                reply_markup=main_menu_kb(),
+            )
+            return
+        if t in {BTN_PROGRESS}:
+            await user_repo.set_dialog(user, state="progress_mode", step=0, data=None)
+            await db.commit()
+            await message.answer(
+                "Ок, режим прогресса.\n"
+                "- Пришли замеры текстом (пример: «талия 102, грудь 112, бедра 108»)\n"
+                "- Или пришли фото прогресса (можно написать в подписи «прогресс»)\n"
+                "- Напиши «сравни» — сравню последние записи/фото.\n\n"
+                "Чтобы отменить — напиши: ❌ Отмена",
                 reply_markup=main_menu_kb(),
             )
             return
@@ -2208,6 +2322,54 @@ async def any_text(message: Message) -> None:
             return
         if t in {BTN_LOG_MEAL}:
             await message.answer("Ок. Напиши прием пищи (например: «гречка 200г, курица 150г, масло 10г»).", reply_markup=main_menu_kb())
+            return
+
+        # reminders setup dialog
+        if user.dialog_state == "reminders_setup":
+            if t in {"❌ Отмена"}:
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await message.answer("Ок, отменил.", reply_markup=main_menu_kb())
+                return
+            # reuse coach memory extractor; it already stores to preferences + coach_notes
+            pref_repo = PreferenceRepo(db)
+            handled = await _apply_coach_memory_if_needed(message, pref_repo=pref_repo, user=user)
+            await user_repo.set_dialog(user, state=None, step=None, data=None)
+            await db.commit()
+            if not handled:
+                await message.answer("Не понял напоминания. Напиши проще (время + что спрашивать).", reply_markup=main_menu_kb())
+            return
+
+        # progress mode dialog (text only; photos handled in photo handler)
+        if user.dialog_state == "progress_mode":
+            if t in {"❌ Отмена"}:
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await message.answer("Ок, вышел из режима прогресса.", reply_markup=main_menu_kb())
+                return
+            # "compare" request
+            if any(x in _norm_text(t) for x in ["сравни", "анализ", "прогресс"]):
+                note_repo = CoachNoteRepo(db)
+                pref_repo = PreferenceRepo(db)
+                plan_repo = PlanRepo(db)
+                handled = await _handle_coach_chat(
+                    message,
+                    pref_repo=pref_repo,
+                    meal_repo=meal_repo,
+                    plan_repo=plan_repo,
+                    note_repo=note_repo,
+                    user=user,
+                )
+                await db.commit()
+                return
+            # store measurements as durable note
+            try:
+                note_repo = CoachNoteRepo(db)
+                await note_repo.add_note(user_id=user.id, kind="measurements", title="Замеры", note_text=t)
+                await db.commit()
+                await message.answer("Сохранил замеры. Напиши «сравни», чтобы я оценил динамику.", reply_markup=main_menu_kb())
+            except Exception:
+                await message.answer("Не смог сохранить замеры. Попробуй ещё раз.", reply_markup=main_menu_kb())
             return
 
         # set_weight dialog
