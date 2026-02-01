@@ -3706,10 +3706,19 @@ async def any_text(message: Message) -> None:
                 last_plan = patched
                 if _plan_quality_ok(patched, kcal_target):
                         break
-            if last_plan is None:
-                raise last_err or RuntimeError("Plan edit failed")
-            if not _plan_quality_ok(last_plan, kcal_target):
-                raise RuntimeError(f"Plan edit quality not OK for target {kcal_target}")
+            if last_plan is None or not _plan_quality_ok(last_plan, kcal_target):
+                err = last_err or RuntimeError(f"Plan edit quality not OK for target {kcal_target}")
+                err_snip = _scrub_secrets(str(err)).strip()
+                err_snip = _escape_html(err_snip[:180]) if err_snip else ""
+                await message.answer(
+                    "⚠️ Не смог качественно внести правку (чтобы сохранить цель КБЖУ).\n\n"
+                    "Варианты:\n"
+                    "- Нажми <b>🔁 Пересобрать рацион</b>\n"
+                    "- Или напиши по‑другому/попроще (пример: «замени перекус 09:00 на вариант за рулём, без молочки»)\n"
+                    + (f"\nТех.деталь: <code>{type(err).__name__}</code>\n<code>{err_snip}</code>" if err_snip else f"\nТех.деталь: <code>{type(err).__name__}</code>"),
+                    reply_markup=plan_edit_kb(),
+                )
+                return
             new_plan = last_plan
             await plan_repo.upsert_day_plan(user_id=user.id, date=edit_date, calories_target=kcal_target, plan=new_plan)
             await db.commit()
