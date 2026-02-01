@@ -4,6 +4,7 @@ import asyncio
 import datetime as dt
 import math
 import re
+import traceback
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -196,6 +197,151 @@ def _has_cyrillic_text(s: str) -> bool:
     return any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in (s or ""))
 
 
+def _coerce_number(x: Any) -> float | None:
+    """
+    Best-effort number parser for model outputs.
+    Accepts: 120, 120.5, "120", "120 г", "120g", "≈120", "120,5".
+    Returns float or None.
+    """
+    try:
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            s = x.strip().replace(",", ".")
+            m = re.search(r"-?\d+(?:\.\d+)?", s)
+            if m:
+                return float(m.group(0))
+    except Exception:
+        return None
+    return None
+
+
+def _scrub_secrets(s: str) -> str:
+    """
+    Avoid leaking tokens in user-facing errors/logs.
+    Very simple masking for OpenAI-style keys.
+    """
+    if not s:
+        return s
+    return re.sub(r"\bsk-[A-Za-z0-9]{10,}\b", "sk-***", s)
+
+
+def _escape_html(s: str) -> str:
+    # minimal HTML escaping for user-facing debug snippets
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _normalize_day_plan(plan: dict[str, Any], *, store_only: str | None) -> dict[str, Any]:
+    """
+    Make the day plan more tolerant to slightly-off model JSON.
+    - Coerce numeric fields from strings ("120 г" -> 120.0)
+    - Ensure required structures are lists/dicts where possible
+    - Enforce store_only if provided (do not persist; only for this plan output)
+    """
+    if not isinstance(plan, dict):
+        return {}
+
+    so = (store_only or "").strip()
+    if so.lower() == "any":
+        so = ""
+
+    meals = plan.get("meals")
+    if not isinstance(meals, list):
+        meals = []
+
+    norm_meals: list[dict[str, Any]] = []
+    for m in meals:
+        if not isinstance(m, dict):
+            continue
+        prods = m.get("products")
+        if not isinstance(prods, list):
+            prods = []
+        norm_prods: list[dict[str, Any]] = []
+        for p in prods:
+            if not isinstance(p, dict):
+                continue
+            name = str(p.get("name") or "").strip()
+            grams = _coerce_number(p.get("grams"))
+            if not name or grams is None or grams <= 0:
+                continue
+            store = str(p.get("store") or "").strip()
+            if so:
+                store = so
+            if not store:
+                store = "Lidl"
+            norm_prods.append({"name": name, "grams": float(grams), "store": store})
+
+        kcal = _coerce_number(m.get("kcal"))
+        prot = _coerce_number(m.get("protein_g"))
+        fat = _coerce_number(m.get("fat_g"))
+        carbs = _coerce_number(m.get("carbs_g"))
+        recipe = m.get("recipe")
+        if not isinstance(recipe, list):
+            recipe = []
+        recipe2 = [str(x).strip() for x in recipe if str(x or "").strip()]
+
+        nm: dict[str, Any] = {
+            "time": str(m.get("time") or "").strip(),
+            "title": str(m.get("title") or "").strip(),
+            "products": norm_prods,
+            "recipe": recipe2,
+        }
+        if kcal is not None:
+            nm["kcal"] = float(kcal)
+        if prot is not None:
+            nm["protein_g"] = float(prot)
+        if fat is not None:
+            nm["fat_g"] = float(fat)
+        if carbs is not None:
+            nm["carbs_g"] = float(carbs)
+        if nm["products"]:
+            norm_meals.append(nm)
+
+    totals = plan.get("totals")
+    if not isinstance(totals, dict):
+        totals = {}
+    tot_kcal = _coerce_number(totals.get("kcal"))
+    tot_p = _coerce_number(totals.get("protein_g"))
+    tot_f = _coerce_number(totals.get("fat_g"))
+    tot_c = _coerce_number(totals.get("carbs_g"))
+    if tot_kcal is None:
+        tot_kcal = sum(float(mm.get("kcal") or 0) for mm in norm_meals)
+    norm_totals: dict[str, Any] = {"kcal": float(tot_kcal)}
+    if tot_p is not None:
+        norm_totals["protein_g"] = float(tot_p)
+    if tot_f is not None:
+        norm_totals["fat_g"] = float(tot_f)
+    if tot_c is not None:
+        norm_totals["carbs_g"] = float(tot_c)
+
+    sl = plan.get("shopping_list")
+    if not isinstance(sl, list):
+        sl = []
+    norm_sl: list[dict[str, Any]] = []
+    for it in sl:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or "").strip()
+        grams = _coerce_number(it.get("grams"))
+        if not name or grams is None or grams <= 0:
+            continue
+        store = str(it.get("store") or "").strip()
+        if so:
+            store = so
+        if not store:
+            store = "Lidl"
+        norm_sl.append({"name": name, "grams": float(grams), "store": store})
+    if not norm_sl:
+        for mm in norm_meals:
+            for pp in (mm.get("products") or []):
+                if isinstance(pp, dict):
+                    norm_sl.append(pp)
+
+    return {"meals": norm_meals, "totals": norm_totals, "shopping_list": norm_sl}
+
+
 def _plan_quality_ok(plan: dict[str, Any], kcal_target: int) -> bool:
     try:
         meals = plan.get("meals") or []
@@ -209,16 +355,17 @@ def _plan_quality_ok(plan: dict[str, Any], kcal_target: int) -> bool:
                 return False
             for p in prods:
                 name = str((p or {}).get("name") or "").strip()
-                if not name or float((p or {}).get("grams") or 0) <= 0:
+                grams = _coerce_number((p or {}).get("grams"))
+                if not name or grams is None or grams <= 0:
                     return False
                 low = name.lower()
                 if any(b in low for b in banned):
                     return False
         totals = plan.get("totals") or {}
-        kcal = totals.get("kcal")
+        kcal = _coerce_number(totals.get("kcal"))
         if kcal is None:
-            kcal = sum(float((m or {}).get("kcal") or 0) for m in meals)
-        kcal = float(kcal)
+            kcal = sum(float(_coerce_number((m or {}).get("kcal")) or 0) for m in meals)
+        kcal = float(kcal or 0)
         return abs(kcal - float(kcal_target)) <= float(kcal_target) * 0.07
     except Exception:
         return False
@@ -2200,11 +2347,28 @@ async def _handle_coach_chat(
         "coach_notes": recent_notes,
     }
 
-    ans = await text_output(
-        system=f"{SYSTEM_COACH}\n\n{COACH_CHAT_GUIDE}",
-        user="Контекст (из БД):\n" + dumps(ctx) + "\n\nВопрос пользователя:\n" + q,
-        max_output_tokens=900,
-    )
+    try:
+        ans = await text_output(
+            system=f"{SYSTEM_COACH}\n\n{COACH_CHAT_GUIDE}",
+            user="Контекст (из БД):\n" + dumps(ctx) + "\n\nВопрос пользователя:\n" + q,
+            max_output_tokens=900,
+        )
+    except Exception as e:
+        try:
+            print("COACH_CHAT_ERROR:", type(e).__name__, _scrub_secrets(str(e))[:500])
+            print(traceback.format_exc())
+        except Exception:
+            pass
+        err_snip = _scrub_secrets(str(e)).strip()
+        err_snip = _escape_html(err_snip[:180]) if err_snip else ""
+        await message.answer(
+            "⚠️ Сейчас не могу ответить как тренер (ошибка AI).\n"
+            "Попробуй ещё раз через минуту или проверь настройки OpenAI (ключ/модель/лимиты).\n"
+            f"Тех.деталь: <code>{type(e).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
+            reply_markup=main_menu_kb(),
+        )
+        return True
+
     out = _safe_nonempty_text(_sanitize_ai_text(ans), fallback="⚠️ Похоже, ответ получился пустым. Попробуй ещё раз (или нажми 🏠 Меню).")
     await message.answer(out[:3900], reply_markup=main_menu_kb())
     return True
@@ -2720,7 +2884,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                     continue
                 models_seen.add(m)
                 try:
-                    plan = await text_json(
+                    plan_raw = await text_json(
                         system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
                         user=user_prompt,
                         model=m,
@@ -2730,8 +2894,12 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                 except Exception as e:
                     last_err = e
                     continue
+                if not isinstance(plan_raw, dict):
+                    last_err = RuntimeError("Plan JSON is not an object")
+                    continue
+                plan = _normalize_day_plan(plan_raw, store_only=store_only)
                 last_plan = plan
-                if isinstance(plan, dict) and _plan_quality_ok(plan, kcal_target):
+                if _plan_quality_ok(plan, kcal_target):
                     break
             if last_plan is None:
                 raise last_err or RuntimeError("Plan generation failed")
@@ -2741,6 +2909,11 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             plan = last_plan
             day_plans.append(plan)
     except Exception as e:
+        try:
+            print("PLAN_GENERATION_ERROR:", type(e).__name__, _scrub_secrets(str(e))[:500])
+            print(traceback.format_exc())
+        except Exception:
+            pass
         # Do NOT send low-quality plain-text plans (they break store constraints and product clarity).
         # Instead, keep user in "plan_edit" mode with a clear retry action.
         try:
@@ -2749,10 +2922,12 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             await db.commit()
         except Exception:
             pass
+        err_snip = _scrub_secrets(str(e)).strip()
+        err_snip = _escape_html(err_snip[:180]) if err_snip else ""
         await message.answer(
             "⚠️ Не смог собрать качественный рацион (ошибка генерации).\n\n"
             "Жми <b>🔁 Пересобрать рацион</b> — я сделаю новый вариант строго под выбранный магазин и твой КБЖУ.\n"
-            f"Тех.деталь: <code>{type(e).__name__}</code>",
+            f"Тех.деталь: <code>{type(e).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
             reply_markup=plan_edit_kb(),
         )
         return
@@ -3514,7 +3689,7 @@ async def any_text(message: Message) -> None:
                     continue
                 models_seen.add(m)
                 try:
-                    patched = await text_json(
+                    patched_raw = await text_json(
                         system=f"{SYSTEM_COACH}\n\n{PLAN_EDIT_JSON}",
                         user=edit_prompt,
                         model=m,
@@ -3524,9 +3699,12 @@ async def any_text(message: Message) -> None:
                 except Exception as e:
                     last_err = e
                     continue
-                if isinstance(patched, dict):
-                    last_plan = patched
-                    if _plan_quality_ok(patched, kcal_target):
+                if not isinstance(patched_raw, dict):
+                    last_err = RuntimeError("Patched plan JSON is not an object")
+                    continue
+                patched = _normalize_day_plan(patched_raw, store_only=store_only)
+                last_plan = patched
+                if _plan_quality_ok(patched, kcal_target):
                         break
             if last_plan is None:
                 raise last_err or RuntimeError("Plan edit failed")
