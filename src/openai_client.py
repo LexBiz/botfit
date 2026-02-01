@@ -24,6 +24,16 @@ def _has_responses_api() -> bool:
     return getattr(client, "responses", None) is not None
 
 
+def _fmt_exc(e: Exception | None) -> str:
+    """
+    Make exception messages informative even when str(e) is empty (e.g. TimeoutError).
+    """
+    if e is None:
+        return "<none>"
+    msg = str(e).strip()
+    return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
+
+
 def _try_parse_json(text: str) -> dict[str, Any] | None:
     t = text.strip()
     try:
@@ -92,7 +102,7 @@ async def _chat_create(
                 last_err = e2
         # If max_completion_tokens is supported, do NOT fall back to max_tokens.
         if not _is_unsupported_param_error(last_err, "max_completion_tokens"):
-            raise RuntimeError(f"Chat completion failed. Last error: {last_err}")
+            raise RuntimeError(f"Chat completion failed. Last error: {_fmt_exc(last_err)}")
 
     # 2) Fallback to max_tokens (only if max_completion_tokens unsupported)
     try:
@@ -116,7 +126,7 @@ async def _chat_create(
                 timeout=timeout_s,
             )
             return (cc.choices[0].message.content or "").strip()
-        raise RuntimeError(f"Chat completion failed. Last error: {last_err}")
+        raise RuntimeError(f"Chat completion failed. Last error: {_fmt_exc(last_err)}")
 
 
 async def _responses_create_text(
@@ -167,7 +177,7 @@ async def _responses_create_text(
         resp = await asyncio.wait_for(client.responses.create(**base_kwargs), timeout=timeout_s)
         return (getattr(resp, "output_text", None) or "").strip()
     except Exception as e:
-        raise RuntimeError(f"Responses create failed. Last error: {last_err or e}")
+        raise RuntimeError(f"Responses create failed. Last error: {_fmt_exc(last_err or e)}")
 
 
 async def text_output(

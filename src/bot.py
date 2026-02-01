@@ -12,6 +12,7 @@ from sqlalchemy import delete, select
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -154,6 +155,20 @@ def _safe_nonempty_text(s: str | None, *, fallback: str) -> str:
     return t if t else fallback
 
 
+async def _safe_answer_html(message: Message, text: str, *, reply_markup: Any = None, limit: int = 3900) -> None:
+    """
+    Bot uses HTML parse mode; model outputs can contain broken HTML (unmatched tags).
+    If Telegram rejects entities, fall back to plain text (escaped HTML).
+    """
+    msg = (text or "").strip()
+    if len(msg) > limit:
+        msg = msg[:limit]
+    try:
+        await message.answer(msg, reply_markup=reply_markup)
+    except TelegramBadRequest:
+        await message.answer(_escape_html(msg), reply_markup=reply_markup)
+
+
 async def _send_html_lines(
     message: Message,
     *,
@@ -190,7 +205,11 @@ async def _send_html_lines(
         chunks.append(cur)
 
     for ch in chunks[:5]:  # safety: don't spam
-        await message.answer(ch, reply_markup=reply_markup or main_menu_kb())
+        try:
+            await message.answer(ch, reply_markup=reply_markup or main_menu_kb())
+        except TelegramBadRequest:
+            # If Telegram rejects HTML entities, fall back to escaped plain text.
+            await message.answer(_escape_html(ch), reply_markup=reply_markup or main_menu_kb())
 
 
 def _has_cyrillic_text(s: str) -> bool:
@@ -2370,7 +2389,7 @@ async def _handle_coach_chat(
         return True
 
     out = _safe_nonempty_text(_sanitize_ai_text(ans), fallback="⚠️ Похоже, ответ получился пустым. Попробуй ещё раз (или нажми 🏠 Меню).")
-    await message.answer(out[:3900], reply_markup=main_menu_kb())
+    await _safe_answer_html(message, out, reply_markup=main_menu_kb())
     return True
 
 
@@ -3060,7 +3079,7 @@ async def cmd_week(message: Message) -> None:
                 max_output_tokens=1200,
             )
             out = _safe_nonempty_text(_sanitize_ai_text(txt), fallback="⚠️ Не смог получить текст анализа. Попробуй ещё раз через пару секунд.")
-            await message.answer(out[:3900], reply_markup=main_menu_kb())
+            await _safe_answer_html(message, out, reply_markup=main_menu_kb())
             return
 
         parts = [
