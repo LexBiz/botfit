@@ -27,6 +27,12 @@ BTN_DAYS_1 = "1 день"
 BTN_DAYS_3 = "3 дня"
 BTN_DAYS_7 = "7 дней"
 
+BTN_STORE_ANY = "🛒 Любой магазин"
+BTN_STORE_KAUFLAND = "🟦 Kaufland"
+BTN_STORE_LIDL = "🟨 Lidl"
+BTN_STORE_ALBERT = "🟥 Albert"
+BTN_STORE_PENNY = "🟩 PENNY"
+
 
 MAIN_BUTTONS: list[list[str]] = [
     [BTN_PROFILE, BTN_WEIGHT],
@@ -115,5 +121,20 @@ def plan_days_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=True,
         input_field_placeholder="На сколько дней?",
+    )
+
+
+def plan_store_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_STORE_ANY],
+        [BTN_STORE_KAUFLAND, BTN_STORE_LIDL],
+        [BTN_STORE_ALBERT, BTN_STORE_PENNY],
+        [BTN_CANCEL],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Где покупаем?",
     )
 

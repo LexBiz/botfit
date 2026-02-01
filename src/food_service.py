@@ -81,6 +81,53 @@ class FoodService:
                 return c.image_url
         return make_search_url(query)
 
+    async def best_product_assets(self, query: str, *, store: str | None = None) -> dict[str, Any]:
+        """
+        Returns best-effort assets:
+        - img_url: direct image (if available)
+        - off_url: openfoodfacts product page (if barcode known)
+        - store_url: store-specific search link (always)
+        """
+        cands = await self.search(query)
+        img_url: str | None = None
+        off_url: str | None = None
+        barcode: str | None = None
+        for c in cands:
+            if img_url is None and c.image_url:
+                img_url = c.image_url
+            if barcode is None and c.barcode:
+                barcode = c.barcode
+            if off_url is None and c.barcode:
+                # concrete product page on OFF
+                base = "https://world.openfoodfacts.org"
+                off_url = f"{base}/product/{c.barcode}"
+            if img_url and off_url:
+                break
+        return {
+            "img_url": img_url,
+            "off_url": off_url,
+            "barcode": barcode,
+            "store_url": make_store_search_url(store or "", query),
+        }
+
+
+def make_store_search_url(store: str, query: str) -> str:
+    from urllib.parse import quote_plus
+
+    q = quote_plus(query)
+    s = (store or "").strip().lower()
+    # NOTE: Store sites change often; keep simple + safe fallbacks.
+    if "kaufl" in s:
+        return f"https://www.kaufland.cz/hledat.html?search_value={q}"
+    if "albert" in s:
+        return f"https://www.albert.cz/vyhledavani?q={q}"
+    if "penny" in s or "peni" in s:
+        return f"https://www.penny.cz/vyhledavani?query={q}"
+    if "lidl" in s:
+        return f"https://www.lidl.cz/hledat?q={q}"
+    # default: best-effort single-store fallback (avoid random sites)
+    return f"https://www.kaufland.cz/hledat.html?search_value={q}"
+
 
 def compute_item_macros(*, grams: float, cand: FoodCandidate) -> dict[str, Any] | None:
     if grams <= 0:

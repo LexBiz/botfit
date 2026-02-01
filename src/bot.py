@@ -7,7 +7,7 @@ import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -41,6 +41,7 @@ from src.prompts import (
     WEEKLY_ANALYSIS_JSON,
 )
 from src.food_service import FoodService, compute_item_macros
+from src.food_service import make_store_search_url
 from src.keyboards import (
     BTN_CANCEL,
     BTN_DAYS_1,
@@ -65,7 +66,13 @@ from src.keyboards import (
     goal_tempo_kb,
     main_menu_kb,
     plan_days_kb,
+    plan_store_kb,
     plan_when_kb,
+    BTN_STORE_ALBERT,
+    BTN_STORE_ANY,
+    BTN_STORE_KAUFLAND,
+    BTN_STORE_LIDL,
+    BTN_STORE_PENNY,
     targets_mode_kb,
 )
 from src.render import recipe_table
@@ -83,7 +90,7 @@ from src.repositories import (
     WeightLogRepo,
 )
 from src.tg_files import download_telegram_file
-from src.models import User
+from src.models import CoachNote, DailyCheckin, Goal, Meal, Plan, Stat, User, WeightLog
 
 
 router = Router()
@@ -381,6 +388,20 @@ async def cmd_reset(message: Message) -> None:
     async with SessionLocal() as db:
         repo = UserRepo(db)
         user = await repo.get_or_create(message.from_user.id, message.from_user.username if message.from_user else None)
+        # wipe durable history (meals/plans/stats/notes/goals/weights/checkins) + preferences json
+        try:
+            await db.execute(delete(Meal).where(Meal.user_id == user.id))
+            await db.execute(delete(Plan).where(Plan.user_id == user.id))
+            await db.execute(delete(Stat).where(Stat.user_id == user.id))
+            await db.execute(delete(CoachNote).where(CoachNote.user_id == user.id))
+            await db.execute(delete(Goal).where(Goal.user_id == user.id))
+            await db.execute(delete(WeightLog).where(WeightLog.user_id == user.id))
+            await db.execute(delete(DailyCheckin).where(DailyCheckin.user_id == user.id))
+            # clear preferences json safely (no delete/create)
+            pref_repo = PreferenceRepo(db)
+            await pref_repo.set_json(user.id, {})
+        except Exception:
+            pass
         user.profile_complete = False
         user.age = None
         user.sex = None
@@ -398,7 +419,7 @@ async def cmd_reset(message: Message) -> None:
         user.carbs_g_target = None
         await repo.set_dialog(user, state=None, step=None, data=None)
         await db.commit()
-    await message.answer("Профиль сброшен. Напиши /start чтобы пройти анкету заново.", reply_markup=main_menu_kb())
+    await message.answer("🧹 Память и профиль сброшены полностью ✅\n\n🚀 Напиши /start — пройдём анкету заново.", reply_markup=main_menu_kb())
 
 
 async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: Any) -> bool:
@@ -2338,6 +2359,15 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
     food_service = FoodService(FoodRepo(db))
     pref_repo = PreferenceRepo(db)
     prefs = await pref_repo.get_json(user.id)
+    # store preference
+    store_only = None
+    try:
+        store_only = str(prefs.get("preferred_store") or "").strip() or None
+        if store_only and store_only.lower() == "any":
+            store_only = None
+    except Exception:
+        store_only = None
+
     # choose target kcal/macros: prefer explicit targets from prefs (incl weekday/weekend)
     targ = prefs.get("targets") if isinstance(prefs.get("targets"), dict) else {}
     def _get_day_kcal(d: dt.date) -> int | None:
@@ -2404,6 +2434,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             last_plan: dict[str, Any] | None = None
             for attempt in range(2):
                 extra = "" if attempt == 0 else "\nВАЖНО: прошлый вариант не соответствовал целевым ккал/или не заполнил продукты/граммы. Исправь."
+                store_line = f"\nВАЖНО: покупка только в магазине: <b>{store_only}</b>. Все products[*].store и shopping_list[*].store должны быть строго '{store_only}'." if store_only else ""
                 plan = await text_json(
                     system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
                     user=(
@@ -2412,9 +2443,10 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                         + dumps(prefs)
                         + f"\nСоставь рацион на {d.isoformat()} на <b>{kcal_target} ккал</b>.\n"
                         + macro_line
+                        + store_line
                         + "Требования:\n"
                         + "- Сумма за день должна попасть в цель (допуск ±5%).\n"
-                        + "- Продукты реальные и типовые для Чехии (Lidl/Kaufland/Albert).\n"
+                        + "- Продукты реальные и типовые для Чехии (Lidl/Kaufland/Albert/PENNY).\n"
                         + "- В каждом приёме пищи обязателен список продуктов с граммами.\n"
                         + "- shopping_list обязателен.\n"
                         + extra
@@ -2486,6 +2518,8 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         for it in (sl or []):
             name = str(it.get("name") or "").strip()
             store = str(it.get("store") or "").strip() or "Lidl"
+            if store_only:
+                store = store_only
             grams = float(it.get("grams") or 0)
             if not name or grams <= 0:
                 continue
@@ -2498,36 +2532,46 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
     shopping_lines: list[str] = []
     for (norm, store), grams in items_sorted[:25]:
         display_name = display.get((norm, store), norm)
-        img_url = await food_service.best_image_url(display_name)
+        assets = await food_service.best_product_assets(display_name, store=store)
+        img_url = assets.get("img_url")
+        off_url = assets.get("off_url")
+        store_url = assets.get("store_url") or make_store_search_url(store, display_name)
         buy_hint = _suggest_buy(display_name, grams)
+        links: list[str] = []
+        if isinstance(img_url, str) and img_url:
+            links.append(f"<a href=\"{img_url}\">📸 фото</a>")
+        if isinstance(store_url, str) and store_url:
+            links.append(f"<a href=\"{store_url}\">🛒 {store}</a>")
+        if isinstance(off_url, str) and off_url:
+            links.append(f"<a href=\"{off_url}\">🔎 OFF</a>")
         shopping_lines.append(
             f"- <b>{display_name}</b> — {grams:.0f} г ({store}). {buy_hint}. "
-            f"<a href=\"{img_url}\">фото</a>"
+            + " | ".join(links)
         )
 
-    parts: list[str] = [f"<b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>"]
+    parts: list[str] = [f"🍽️ <b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>"]
     for di, plan in enumerate(day_plans):
         d = start_date + dt.timedelta(days=di)
         meals = plan.get("meals") or []
         totals = plan.get("totals") or {}
-        parts.append(f"\n<b>День {di+1} — {d.isoformat()}</b>")
+        parts.append(f"\n📅 <b>День {di+1} — {d.isoformat()}</b>")
         for i, m in enumerate(meals, start=1):
             tm = str(m.get("time") or "").strip()
             tm_txt = f"{tm} — " if tm else ""
             parts.append(
-                f"\n<b>{i}. {tm_txt}{m.get('title')}</b>\n"
-                f"КБЖУ: {m.get('kcal')} ккал | Б {m.get('protein_g')} | Ж {m.get('fat_g')} | У {m.get('carbs_g')}\n"
-                "Продукты:\n"
+                f"\n🍽️ <b>{i}. {tm_txt}{m.get('title')}</b>\n"
+                f"🔥 КБЖУ: {m.get('kcal')} ккал | 🥩 Б {m.get('protein_g')} | 🧈 Ж {m.get('fat_g')} | 🍚 У {m.get('carbs_g')}\n"
+                "🧺 Продукты:\n"
                 + "\n".join([f"- {p.get('name')} — {p.get('grams')} г ({p.get('store')})" for p in (m.get('products') or [])])
-                + "\nРецепт:\n"
+                + "\n👨‍🍳 Рецепт:\n"
                 + "\n".join([f"- {s}" for s in (m.get('recipe') or [])])
             )
         parts.append(
-            f"\n<b>Итого дня</b>: {totals.get('kcal')} ккал | Б {totals.get('protein_g')} | Ж {totals.get('fat_g')} | У {totals.get('carbs_g')}"
+            f"\n✅ <b>Итого дня</b>: 🔥 {totals.get('kcal')} ккал | 🥩 {totals.get('protein_g')} | 🧈 {totals.get('fat_g')} | 🍚 {totals.get('carbs_g')}"
         )
 
     if shopping_lines:
-        shopping_text = "<b>Список покупок (суммарно)</b>:\n" + "\n".join(shopping_lines)
+        shopping_text = "🛒 <b>Список покупок (суммарно)</b>:\n" + "\n".join(shopping_lines)
     else:
         shopping_text = ""
 
@@ -2923,7 +2967,7 @@ async def any_text(message: Message) -> None:
             return
 
         # plan dialogs (date + days)
-        if user.dialog_state in {"plan_when", "plan_date", "plan_days"}:
+        if user.dialog_state in {"plan_when", "plan_date", "plan_store", "plan_days"}:
             if t in {BTN_CANCEL, "❌ Отмена", BTN_MENU}:
                 await user_repo.set_dialog(user, state=None, step=None, data=None)
                 await db.commit()
@@ -2951,9 +2995,9 @@ async def any_text(message: Message) -> None:
                     await message.answer("Выбери день кнопкой 👇", reply_markup=plan_when_kb())
                     return
 
-                await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat()})
+                await user_repo.set_dialog(user, state="plan_store", step=0, data={"start_date": start_date.isoformat()})
                 await db.commit()
-                await message.answer(f"Ок. Старт: <b>{start_date.isoformat()}</b>. На сколько дней? (1-7)", reply_markup=plan_days_kb())
+                await message.answer(f"🛒 Ок. Старт: <b>{start_date.isoformat()}</b>.\nГде покупаем?", reply_markup=plan_store_kb())
                 return
 
             if user.dialog_state == "plan_date":
@@ -2985,9 +3029,47 @@ async def any_text(message: Message) -> None:
                     await message.answer(f"Эта дата в прошлом ({start_date.isoformat()}). Введи будущую/сегодня.", reply_markup=main_menu_kb())
                     return
 
-                await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat()})
+                await user_repo.set_dialog(user, state="plan_store", step=0, data={"start_date": start_date.isoformat()})
                 await db.commit()
-                await message.answer(f"Ок. Старт: <b>{start_date.isoformat()}</b>. На сколько дней? (1-7)", reply_markup=plan_days_kb())
+                await message.answer(f"🛒 Ок. Старт: <b>{start_date.isoformat()}</b>.\nГде покупаем?", reply_markup=plan_store_kb())
+                return
+
+            if user.dialog_state == "plan_store":
+                # normalize store choice
+                store_choice = None
+                if t == BTN_STORE_ANY:
+                    store_choice = "any"
+                elif t == BTN_STORE_KAUFLAND:
+                    store_choice = "Kaufland"
+                elif t == BTN_STORE_LIDL:
+                    store_choice = "Lidl"
+                elif t == BTN_STORE_ALBERT:
+                    store_choice = "Albert"
+                elif t == BTN_STORE_PENNY:
+                    store_choice = "PENNY"
+                else:
+                    await message.answer("Выбери магазин кнопкой 👇", reply_markup=plan_store_kb())
+                    return
+
+                # persist preference as default for future plans
+                try:
+                    pref_repo = PreferenceRepo(db)
+                    await pref_repo.merge(user.id, {"preferred_store": store_choice})
+                except Exception:
+                    pass
+
+                start_date = today_local
+                try:
+                    data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+                    sd = (data or {}).get("start_date")
+                    if isinstance(sd, str):
+                        start_date = dt.date.fromisoformat(sd)
+                except Exception:
+                    pass
+
+                await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat(), "preferred_store": store_choice})
+                await db.commit()
+                await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b> | 🛒 Магазин: <b>{store_choice}</b>\nНа сколько дней? (1-7)", reply_markup=plan_days_kb())
                 return
 
             if user.dialog_state == "plan_days":
