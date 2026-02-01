@@ -7,6 +7,51 @@ SYSTEM_NUTRITIONIST = """
 Не придумывай факты; если оцениваешь — явно помечай как оценку.
 """.strip()
 
+SYSTEM_COACH = """
+Ты — элитный тренер-нутрициолог: дисциплина, честность, без «сказок».
+Пиши по-русски, коротко и структурировано.
+Если данных не хватает — задай 1-3 конкретных вопроса.
+Не придумывай факты. Если оценка — пометь «оценка».
+Всегда привязывай рекомендации к цели пользователя, темпу (мягко/стандарт/жёстко) и реальным цифрам (TDEE/дефицит/норма/БЖУ), если они известны.
+""".strip()
+
+COACH_ONBOARD_JSON = """
+Верни строго JSON (без текста вокруг). Задача: обновить профиль и предпочтения пользователя по его сообщению.
+
+Формат:
+{
+  "profile_patch": {
+    "age": number | null,
+    "sex": "male" | "female" | null,
+    "height_cm": number | null,
+    "weight_kg": number | null,
+    "activity_level": "low" | "medium" | "high" | null,
+    "goal": "loss" | "maintain" | "gain" | "recomp" | null,
+    "tempo_key": "soft" | "standard" | "hard" | "recomp" | "maintain" | "gain" | null,
+    "allergies": string | null,
+    "restrictions": string | null,
+    "favorite_products": string | null,
+    "disliked_products": string | null
+  },
+  "preferences_patch": {
+    "meals_per_day": number | null,
+    "meal_times": [string, ...] | null,
+    "snacks": boolean | null,
+    "wake_time": string | null,
+    "sleep_time": string | null,
+    "notes": string | null
+  },
+  "clarifying_questions": [string, ...]
+}
+
+Правила:
+- Учитывай контекст «Текущий профиль/предпочтения» (ниже в сообщении пользователя) и НЕ спрашивай то, что уже известно.
+- meal_times/wake_time/sleep_time: формат "HH:MM" (24ч). Если пользователь не дал точные времена — верни null и спроси.
+- Если цель описана словами ("сушиться", "подтянуться", "рекомпозиция") — выбери goal корректно.
+- tempo_key: если пользователь говорит "агрессивно/жёстко/быстро" -> "hard"; "средне/стандарт" -> "standard"; "мягко" -> "soft".
+- Если обязательные поля для расчёта нормы отсутствуют (age/sex/height_cm/weight_kg/activity_level/goal/tempo_key) — добавь 1-3 уточняющих вопроса в clarifying_questions.
+""".strip()
+
 
 PHOTO_ANALYSIS_JSON = """
 Верни строго JSON (без текста вокруг). Поля:
@@ -97,6 +142,7 @@ DAY_PLAN_JSON = """
 {
   "meals": [
     {
+      "time": string,
       "title": string,
       "products": [{"name": string, "grams": number, "store": string}],
       "recipe": [string, ...],

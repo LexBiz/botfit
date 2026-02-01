@@ -30,15 +30,30 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     )
 
 
-def goal_tempo_kb() -> ReplyKeyboardMarkup:
-    # universal set; assistant will clamp if needed
+def goal_tempo_kb(preview_kcal: dict[str, int] | None = None) -> ReplyKeyboardMarkup:
+    """
+    preview_kcal: optional mapping tempo_key -> kcal/day to show in button labels
+    (kept parseable by substring keywords in bot.py)
+    """
+    pk = preview_kcal or {}
+    def _p(k: str) -> str:
+        v = pk.get(k)
+        return f" ~{v} ккал" if isinstance(v, int) else ""
+
+    hard = f"🔥 Жёстко (быстрее{_p('hard')})"
+    std = f"✅ Стандарт{_p('standard')}"
+    soft = f"🟢 Мягко{_p('soft')}"
+    recomp = f"🧱 Рекомпозиция{_p('recomp')}"
+    maint = f"⚖️ Поддержание{_p('maintain')}"
+    gain = f"📈 Набор{_p('gain')}"
+
     rows = [
-        ["🔥 Жёстко (быстрее)"],
-        ["✅ Стандарт"],
-        ["🟢 Мягко"],
-        ["🧱 Рекомпозиция"],
-        ["⚖️ Поддержание"],
-        ["📈 Набор"],
+        [hard],
+        [std],
+        [soft],
+        [recomp],
+        [maint],
+        [gain],
     ]
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],

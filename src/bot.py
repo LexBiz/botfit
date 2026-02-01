@@ -21,6 +21,7 @@ from src.nutrition import compute_targets, compute_targets_with_meta
 from src.audio import ogg_opus_to_wav_bytes
 from src.openai_client import text_json, text_output, transcribe_audio, vision_json
 from src.prompts import (
+    COACH_ONBOARD_JSON,
     DAY_PLAN_JSON,
     MEAL_ITEMS_JSON,
     MEAL_FROM_PHOTO_FINAL_JSON,
@@ -28,6 +29,7 @@ from src.prompts import (
     PHOTO_ANALYSIS_JSON,
     PHOTO_TO_ITEMS_JSON,
     ROUTER_JSON,
+    SYSTEM_COACH,
     SYSTEM_NUTRITIONIST,
     WEEKLY_ANALYSIS_JSON,
 )
@@ -175,6 +177,22 @@ async def _start_onboarding(message: Message, user_repo: UserRepo, user: Any) ->
         f"1/10 — {ONBOARDING_QUESTIONS[1]}"
     )
 
+async def _start_coach_onboarding(message: Message, user_repo: UserRepo, user: Any) -> None:
+    # AI-first onboarding: user can answer freely, we extract + ask only what missing
+    await user_repo.set_dialog(user, state="coach_onboarding", step=1, data={"profile": {}, "prefs": {}})
+    await message.answer(
+        "Ок, делаем по-взрослому — как с тренером.\n"
+        "Напиши одним сообщением (можно своими словами):\n"
+        "- возраст, пол, рост, вес\n"
+        "- активность (сидячая/средняя/высокая)\n"
+        "- цель (похудение/поддержание/набор/рекомпозиция) и темп (мягко/стандарт/жёстко)\n"
+        "- режим дня: во сколько встаёшь/ложишься, сколько приёмов пищи, есть ли перекусы\n"
+        "- аллергии/ограничения, любимое/нелюбимое\n\n"
+        "Пример: «29 м 190/118, активность средняя, хочу рекомпозицию, темп стандарт, 3 приёма + перекус, "
+        "встаю 07:30, сплю 23:30, без лактозы, люблю курицу/рис, не люблю рыбу».",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
@@ -191,8 +209,8 @@ async def cmd_start(message: Message) -> None:
                 reply_markup=main_menu_kb(),
             )
             return
-
-        await _start_onboarding(message, repo, user)
+        # default to AI-coach onboarding
+        await _start_coach_onboarding(message, repo, user)
         await db.commit()
 
 
@@ -406,6 +424,38 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
 
         answers["goal"] = g
         answers["goal_raw"] = (message.text or "").strip()
+
+        # show tempo previews (kcal) so user can choose correctly
+        preview: dict[str, int] | None
+        preview_text: str
+        try:
+            tdee_only = compute_targets_with_meta(
+                sex=answers["sex"],
+                age=int(answers["age"]),
+                height_cm=float(answers["height_cm"]),
+                weight_kg=float(answers["weight_kg"]),
+                activity=answers["activity_level"],
+                goal=str(answers["goal"]),
+                deficit_pct=0.0,
+            )[1].tdee_kcal
+            preview = {
+                "soft": int(round(tdee_only * (1 - 0.10))),
+                "standard": int(round(tdee_only * (1 - 0.15))),
+                "hard": int(round(tdee_only * (1 - 0.25))),
+                "recomp": int(round(tdee_only * (1 - 0.10))),
+                "maintain": int(round(tdee_only)),
+                "gain": int(round(tdee_only * (1 + 0.10))),
+            }
+            preview_text = (
+                f"При твоих данных поддержание (TDEE) ≈ <b>{tdee_only} ккал</b>.\n"
+                f"Если выбрать темп:\n"
+                f"- 🟢 Мягко (~10%): ~{preview['soft']} ккал\n"
+                f"- ✅ Стандарт (~15%): ~{preview['standard']} ккал\n"
+                f"- 🔥 Жёстко (~25%): ~{preview['hard']} ккал\n"
+            )
+        except Exception:
+            preview = None
+            preview_text = ""
         await user_repo.set_dialog(
             user,
             state="onboarding",
@@ -414,8 +464,9 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
         )
         await message.answer(
             f"Ок, цель: <b>{_fmt_goal(g)}</b>.\n"
-            "Теперь выбери темп (он влияет на дефицит/профицит):",
-            reply_markup=goal_tempo_kb(),
+            + (preview_text + "\n" if preview_text else "")
+            + "Теперь выбери темп (он влияет на дефицит/профицит):",
+            reply_markup=goal_tempo_kb(preview),
         )
         return True
 
@@ -504,6 +555,169 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
     next_step = step + 1
     await user_repo.set_dialog(user, state="onboarding", step=next_step, data={"answers": answers})
     await message.answer(f"{next_step}/10 — {ONBOARDING_QUESTIONS[next_step]}")
+    return True
+
+
+async def _handle_coach_onboarding(message: Message, user_repo: UserRepo, user: Any) -> bool:
+    if user.dialog_state != "coach_onboarding":
+        return False
+    if not message.text:
+        await message.answer("Пришли текстом (одним сообщением).", reply_markup=ReplyKeyboardRemove())
+        return True
+
+    pref_repo = PreferenceRepo(user_repo.db)
+    prefs = await pref_repo.get_json(user.id)
+    data = await user_repo.get_dialog_data(user) or {"profile": {}, "prefs": {}}
+    prof = data.get("profile") or {}
+    pref_local = data.get("prefs") or {}
+
+    extracted = await text_json(
+        system=f"{SYSTEM_COACH}\n\n{COACH_ONBOARD_JSON}",
+        user=(
+            "Текущий профиль (что уже известно):\n"
+            + dumps(
+                {
+                    "age": user.age,
+                    "sex": user.sex,
+                    "height_cm": user.height_cm,
+                    "weight_kg": user.weight_kg,
+                    "activity_level": user.activity_level,
+                    "goal": user.goal,
+                    "allergies": user.allergies,
+                    "restrictions": user.restrictions,
+                    "favorite_products": user.favorite_products,
+                    "disliked_products": user.disliked_products,
+                }
+            )
+            + "\nТекущие предпочтения:\n"
+            + dumps(prefs)
+            + "\nЛокально собранные данные (в этой сессии):\n"
+            + dumps({"profile": prof, "prefs": pref_local})
+            + "\nСообщение пользователя:\n"
+            + (message.text or "").strip()
+        ),
+        max_output_tokens=900,
+    )
+
+    profile_patch = extracted.get("profile_patch") or {}
+    prefs_patch = extracted.get("preferences_patch") or {}
+    qs = extracted.get("clarifying_questions") or []
+
+    def _num(x: Any) -> float | None:
+        try:
+            if x is None:
+                return None
+            return float(x)
+        except Exception:
+            return None
+
+    # validate/normalize patches
+    if (a := _num(profile_patch.get("age"))) is not None and 10 <= a <= 100:
+        prof["age"] = int(round(a))
+    if (s := profile_patch.get("sex")) in {"male", "female"}:
+        prof["sex"] = str(s)
+    if (h := _num(profile_patch.get("height_cm"))) is not None and 120 <= h <= 230:
+        prof["height_cm"] = float(h)
+    if (w := _num(profile_patch.get("weight_kg"))) is not None and 30 <= w <= 300:
+        prof["weight_kg"] = float(w)
+    if (act := profile_patch.get("activity_level")) in {"low", "medium", "high"}:
+        prof["activity_level"] = str(act)
+    if (g := profile_patch.get("goal")) in {"loss", "maintain", "gain", "recomp"}:
+        prof["goal"] = str(g)
+    if isinstance(profile_patch.get("allergies"), str):
+        prof["allergies"] = str(profile_patch.get("allergies")).strip()
+    if isinstance(profile_patch.get("restrictions"), str):
+        prof["restrictions"] = str(profile_patch.get("restrictions")).strip()
+    if isinstance(profile_patch.get("favorite_products"), str):
+        prof["favorite_products"] = str(profile_patch.get("favorite_products")).strip()
+    if isinstance(profile_patch.get("disliked_products"), str):
+        prof["disliked_products"] = str(profile_patch.get("disliked_products")).strip()
+
+    tempo_key = profile_patch.get("tempo_key")
+    if tempo_key in GOAL_TEMPO:
+        prof["tempo_key"] = str(tempo_key)
+        prof["deficit_pct"] = float(GOAL_TEMPO[str(tempo_key)][1])
+
+    # preferences
+    if (mpd := _num(prefs_patch.get("meals_per_day"))) is not None and 1 <= mpd <= 8:
+        pref_local["meals_per_day"] = int(round(mpd))
+    if isinstance(prefs_patch.get("meal_times"), list):
+        times: list[str] = []
+        for t in prefs_patch.get("meal_times")[:8]:
+            if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip()):
+                times.append(t.strip())
+        if times:
+            pref_local["meal_times"] = times
+    if isinstance(prefs_patch.get("snacks"), bool):
+        pref_local["snacks"] = bool(prefs_patch.get("snacks"))
+    if isinstance(prefs_patch.get("wake_time"), str) and re.fullmatch(r"\d{2}:\d{2}", prefs_patch["wake_time"].strip()):
+        pref_local["wake_time"] = prefs_patch["wake_time"].strip()
+    if isinstance(prefs_patch.get("sleep_time"), str) and re.fullmatch(r"\d{2}:\d{2}", prefs_patch["sleep_time"].strip()):
+        pref_local["sleep_time"] = prefs_patch["sleep_time"].strip()
+    if isinstance(prefs_patch.get("notes"), str) and prefs_patch.get("notes"):
+        pref_local["notes"] = str(prefs_patch.get("notes")).strip()
+
+    await user_repo.set_dialog(user, state="coach_onboarding", step=1, data={"profile": prof, "prefs": pref_local})
+
+    required = {"age", "sex", "height_cm", "weight_kg", "activity_level", "goal", "tempo_key", "deficit_pct"}
+    if not required.issubset(set(prof.keys())):
+        if not qs:
+            qs = ["Что не хватает из: возраст, пол, рост, вес, активность, цель и темп (мягко/стандарт/жёстко)?"]
+        await message.answer("\n".join([f"- {q}" for q in qs[:3]]))
+        return True
+
+    # finalize: persist to user + preferences
+    user.age = int(prof["age"])
+    user.sex = str(prof["sex"])
+    user.height_cm = float(prof["height_cm"])
+    user.weight_kg = float(prof["weight_kg"])
+    user.activity_level = str(prof["activity_level"])
+    user.goal = str(prof["goal"])
+    user.allergies = str(prof.get("allergies") or "")
+    user.restrictions = str(prof.get("restrictions") or "")
+    user.favorite_products = str(prof.get("favorite_products") or "")
+    user.disliked_products = str(prof.get("disliked_products") or "")
+
+    if not user.country:
+        user.country = settings.default_country
+    if not user.stores_csv:
+        user.stores_csv = settings.default_stores
+
+    t, meta = compute_targets_with_meta(
+        sex=user.sex,  # type: ignore[arg-type]
+        age=user.age,
+        height_cm=user.height_cm,
+        weight_kg=user.weight_kg,
+        activity=user.activity_level,  # type: ignore[arg-type]
+        goal=user.goal,  # type: ignore[arg-type]
+        deficit_pct=float(prof["deficit_pct"]),
+    )
+    user.calories_target = t.calories
+    user.protein_g_target = t.protein_g
+    user.fat_g_target = t.fat_g
+    user.carbs_g_target = t.carbs_g
+    user.profile_complete = True
+
+    await pref_repo.merge(
+        user.id,
+        {
+            **pref_local,
+            "tempo_key": prof.get("tempo_key"),
+            "deficit_pct": meta.deficit_pct,
+            "bmr_kcal": meta.bmr_kcal,
+            "tdee_kcal": meta.tdee_kcal,
+        },
+    )
+
+    await user_repo.set_dialog(user, state=None, step=None, data=None)
+    await message.answer(
+        "Профиль готов. Работаем по цифрам.\n\n"
+        f"Поддержание (TDEE): <b>{meta.tdee_kcal} ккал</b>\n"
+        f"Темп: <b>{_fmt_pct(meta.deficit_pct)}</b> (дефицит {meta.deficit_kcal} ккал/день)\n"
+        f"Твоя норма: <b>{t.calories} ккал</b>\n"
+        f"БЖУ: <b>{t.protein_g}/{t.fat_g}/{t.carbs_g} г</b>",
+        reply_markup=main_menu_kb(),
+    )
     return True
 
 
@@ -1136,6 +1350,8 @@ async def cmd_plan(message: Message) -> None:
 async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int) -> None:
     plan_repo = PlanRepo(db)
     food_service = FoodService(FoodRepo(db))
+    pref_repo = PreferenceRepo(db)
+    prefs = await pref_repo.get_json(user.id)
     start_date = dt.date.today()
     try:
         day_plans: list[dict[str, Any]] = []
@@ -1143,7 +1359,17 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             d = start_date + dt.timedelta(days=i)
             plan = await text_json(
                 system=f"{SYSTEM_NUTRITIONIST}\n\n{DAY_PLAN_JSON}",
-                user=_profile_context(user) + f"\nСоставь рацион на {d.isoformat()} на {user.calories_target} ккал.",
+                user=(
+                    _profile_context(user)
+                    + "\nПредпочтения/режим дня (из БД):\n"
+                    + dumps(prefs)
+                    + f"\nСоставь рацион на {d.isoformat()} на {user.calories_target} ккал.\n"
+                    + "Требования:\n"
+                    + "- Сделай разнообразно (не повторяй одинаковые блюда изо дня в день).\n"
+                    + "- Если есть meal_times — привяжи приёмы пищи к этим временам.\n"
+                    + "- Учитывай ограничения/аллергии/нелюбимое.\n"
+                    + "- shopping_list обязательно заполни.\n"
+                ),
                 max_output_tokens=1400,
             )
             day_plans.append(plan)
@@ -1194,7 +1420,15 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
     agg: dict[tuple[str, str], float] = {}
     display: dict[tuple[str, str], str] = {}
     for plan in day_plans:
-        for it in (plan.get("shopping_list") or []):
+        # some models may forget shopping_list; build fallback from meal products
+        sl = plan.get("shopping_list")
+        if not sl:
+            sl = []
+            for m in (plan.get("meals") or []):
+                for p in (m.get("products") or []):
+                    sl.append(p)
+
+        for it in (sl or []):
             name = str(it.get("name") or "").strip()
             store = str(it.get("store") or "").strip() or "Lidl"
             grams = float(it.get("grams") or 0)
@@ -1223,8 +1457,10 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         totals = plan.get("totals") or {}
         parts.append(f"\n<b>День {di+1} — {d.isoformat()}</b>")
         for i, m in enumerate(meals, start=1):
+            tm = str(m.get("time") or "").strip()
+            tm_txt = f"{tm} — " if tm else ""
             parts.append(
-                f"\n<b>{i}. {m.get('title')}</b>\n"
+                f"\n<b>{i}. {tm_txt}{m.get('title')}</b>\n"
                 f"КБЖУ: {m.get('kcal')} ккал | Б {m.get('protein_g')} | Ж {m.get('fat_g')} | У {m.get('carbs_g')}\n"
                 "Продукты:\n"
                 + "\n".join([f"- {p.get('name')} — {p.get('grams')} г ({p.get('store')})" for p in (m.get('products') or [])])
@@ -1236,9 +1472,14 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         )
 
     if shopping_lines:
-        parts.append("\n<b>Список покупок (суммарно)</b>:\n" + "\n".join(shopping_lines))
+        shopping_text = "<b>Список покупок (суммарно)</b>:\n" + "\n".join(shopping_lines)
+    else:
+        shopping_text = ""
 
+    # send plan and shopping list separately to avoid Telegram message truncation
     await message.answer("\n".join(parts)[:3900], reply_markup=main_menu_kb())
+    if shopping_text:
+        await message.answer(shopping_text[:3900], reply_markup=main_menu_kb())
 
 
 @router.message(Command("recipe"))
@@ -1365,6 +1606,11 @@ async def any_text(message: Message) -> None:
         food_repo = FoodRepo(db)
         food_service = FoodService(food_repo)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
+
+        handled = await _handle_coach_onboarding(message, user_repo, user)
+        if handled:
+            await db.commit()
+            return
 
         handled = await _handle_onboarding_step(message, user_repo, user)
         if handled:
