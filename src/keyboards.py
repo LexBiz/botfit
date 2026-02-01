@@ -33,6 +33,10 @@ BTN_STORE_LIDL = "🟨 Lidl"
 BTN_STORE_ALBERT = "🟥 Albert"
 BTN_STORE_PENNY = "🟩 PENNY"
 
+BTN_PLAN_APPROVE = "✅ Утвердить рацион"
+BTN_PLAN_REGEN = "🔁 Пересобрать рацион"
+BTN_PLAN_EDIT_CANCEL = "↩️ Закрыть правки"
+
 
 MAIN_BUTTONS: list[list[str]] = [
     [BTN_PROFILE, BTN_WEIGHT],
@@ -133,5 +137,18 @@ def plan_store_kb() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
         resize_keyboard=True,
         input_field_placeholder="Где покупаем?",
+    )
+
+
+def plan_edit_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_PLAN_APPROVE],
+        [BTN_PLAN_REGEN],
+        [BTN_PLAN_EDIT_CANCEL],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        input_field_placeholder="Напиши, что поменять в рационе",
     )
 

@@ -33,6 +33,7 @@ from src.prompts import (
     MEAL_ITEMS_JSON,
     MEAL_FROM_PHOTO_FINAL_JSON,
     MEAL_FROM_TEXT_JSON,
+    PLAN_EDIT_JSON,
     PHOTO_ANALYSIS_JSON,
     PHOTO_TO_ITEMS_JSON,
     ROUTER_JSON,
@@ -66,6 +67,7 @@ from src.keyboards import (
     goal_tempo_kb,
     main_menu_kb,
     plan_days_kb,
+    plan_edit_kb,
     plan_store_kb,
     plan_when_kb,
     BTN_STORE_ALBERT,
@@ -73,6 +75,9 @@ from src.keyboards import (
     BTN_STORE_KAUFLAND,
     BTN_STORE_LIDL,
     BTN_STORE_PENNY,
+    BTN_PLAN_APPROVE,
+    BTN_PLAN_REGEN,
+    BTN_PLAN_EDIT_CANCEL,
     targets_mode_kb,
 )
 from src.render import recipe_table
@@ -145,6 +150,157 @@ def _sanitize_ai_text(s: str) -> str:
 def _has_cyrillic_text(s: str) -> bool:
     return any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in (s or ""))
 
+
+def _plan_quality_ok(plan: dict[str, Any], kcal_target: int) -> bool:
+    try:
+        meals = plan.get("meals") or []
+        if not isinstance(meals, list) or not meals:
+            return False
+        for m in meals:
+            prods = (m or {}).get("products") or []
+            if not isinstance(prods, list) or not prods:
+                return False
+            for p in prods:
+                if not p or not p.get("name") or float(p.get("grams") or 0) <= 0:
+                    return False
+        totals = plan.get("totals") or {}
+        kcal = totals.get("kcal")
+        if kcal is None:
+            kcal = sum(float((m or {}).get("kcal") or 0) for m in meals)
+        kcal = float(kcal)
+        return abs(kcal - float(kcal_target)) <= float(kcal_target) * 0.07
+    except Exception:
+        return False
+
+
+async def _load_day_plans(*, plan_repo: PlanRepo, user_id: int, start_date: dt.date, days: int) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for i in range(days):
+        d = start_date + dt.timedelta(days=i)
+        p = await plan_repo.get_day_plan_json(user_id, d)
+        out.append(p or {})
+    return out
+
+
+async def _send_plans(
+    message: Message,
+    *,
+    db: Any,
+    user: Any,
+    start_date: dt.date,
+    day_plans: list[dict[str, Any]],
+    prefs: dict[str, Any],
+) -> None:
+    food_service = FoodService(FoodRepo(db))
+
+    def _norm_name(n: str) -> str:
+        return re.sub(r"\s+", " ", n.strip().lower())
+
+    def _suggest_buy(name: str, grams: float) -> str:
+        n = _norm_name(name)
+        g = max(float(grams), 0.0)
+        if "яйц" in n:
+            pcs = max(1, int(math.ceil(g / 60.0)))
+            packs = int(math.ceil(pcs / 10.0))
+            return f"Купить: ~{packs}×10 шт (нужно ~{pcs} шт)"
+        step = 100.0
+        if any(k in n for k in ["рис", "паст", "овся", "греч", "мук", "круп", "макарон"]):
+            step = 500.0
+        elif any(k in n for k in ["кур", "индей", "говя", "свини", "рыб", "лосос", "тунец"]):
+            step = 500.0
+        elif any(k in n for k in ["йогур", "творог", "скыр", "сыр", "молок", "кефир"]):
+            step = 200.0
+        buy = int(math.ceil(g / step) * step)
+        packs = int(math.ceil(g / step))
+        return f"Купить: ~{buy:.0f} г ({packs}×{step:.0f} г) — ориентир"
+
+    # aggregate shopping list across days
+    store_only = None
+    try:
+        store_only = str(prefs.get("preferred_store") or "").strip() or None
+        if store_only and store_only.lower() == "any":
+            store_only = None
+    except Exception:
+        store_only = None
+
+    agg: dict[tuple[str, str], float] = {}
+    display: dict[tuple[str, str], str] = {}
+    for plan in day_plans:
+        sl = plan.get("shopping_list")
+        if not sl:
+            sl = []
+            for m in (plan.get("meals") or []):
+                for p in (m.get("products") or []):
+                    sl.append(p)
+        for it in (sl or []):
+            name = str(it.get("name") or "").strip()
+            store = str(it.get("store") or "").strip() or "Lidl"
+            if store_only:
+                store = store_only
+            grams = float(it.get("grams") or 0)
+            if not name or grams <= 0:
+                continue
+            key = (_norm_name(name), store)
+            agg[key] = agg.get(key, 0.0) + grams
+            display.setdefault(key, name)
+
+    items_sorted = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
+    shopping_lines: list[str] = []
+    for (norm, store), grams in items_sorted[:25]:
+        orig_name = display.get((norm, store), norm)
+        assets = await food_service.best_product_assets(orig_name, store=store)
+        img_url = assets.get("img_url")
+        off_url = assets.get("off_url")
+        store_url = assets.get("store_url") or make_store_search_url(store, orig_name)
+        best_name = assets.get("best_name")
+        brand = assets.get("brand")
+        search_query = assets.get("search_query")
+        display_name = orig_name
+        if isinstance(best_name, str) and best_name.strip():
+            display_name = best_name.strip()
+        if isinstance(brand, str) and brand.strip():
+            display_name = f"{brand.strip()} — {display_name}"
+        if _has_cyrillic_text(display_name):
+            sq = assets.get("search_query")
+            if isinstance(sq, str) and sq:
+                store_url = make_store_search_url(store, sq)
+        buy_hint = _suggest_buy(display_name, grams)
+        links: list[str] = []
+        if isinstance(img_url, str) and img_url:
+            links.append(f"<a href=\"{img_url}\">📸 фото</a>")
+        if isinstance(store_url, str) and store_url:
+            links.append(f"<a href=\"{store_url}\">🛒 {store}</a>")
+        if isinstance(off_url, str) and off_url:
+            links.append(f"<a href=\"{off_url}\">🔎 OFF</a>")
+        q_hint = f" 🔎 запрос: <code>{search_query}</code>" if isinstance(search_query, str) and search_query else ""
+        shopping_lines.append(f"- <b>{display_name}</b> — {grams:.0f} г ({store}). {buy_hint}. " + " | ".join(links) + q_hint)
+
+    days = len(day_plans)
+    parts: list[str] = [f"🍽️ <b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>"]
+    for di, plan in enumerate(day_plans):
+        d = start_date + dt.timedelta(days=di)
+        meals = plan.get("meals") or []
+        totals = plan.get("totals") or {}
+        parts.append(f"\n📅 <b>День {di+1} — {d.isoformat()}</b>")
+        for i, m in enumerate(meals, start=1):
+            tm = str(m.get("time") or "").strip()
+            tm_txt = f"{tm} — " if tm else ""
+            parts.append(
+                f"\n🍽️ <b>{i}. {tm_txt}{m.get('title')}</b>\n"
+                f"🔥 КБЖУ: {m.get('kcal')} ккал | 🥩 Б {m.get('protein_g')} | 🧈 Ж {m.get('fat_g')} | 🍚 У {m.get('carbs_g')}\n"
+                "🧺 Продукты:\n"
+                + "\n".join([f"- {p.get('name')} — {p.get('grams')} г ({p.get('store')})" for p in (m.get("products") or [])])
+                + "\n👨‍🍳 Рецепт:\n"
+                + "\n".join([f"- {s}" for s in (m.get("recipe") or [])])
+            )
+        parts.append(
+            f"\n✅ <b>Итого дня</b>: 🔥 {totals.get('kcal')} ккал | 🥩 {totals.get('protein_g')} | 🧈 {totals.get('fat_g')} | 🍚 {totals.get('carbs_g')}"
+        )
+
+    shopping_text = "🛒 <b>Список покупок (суммарно)</b>:\n" + "\n".join(shopping_lines) if shopping_lines else ""
+    await message.answer("\n".join(parts)[:3900], reply_markup=main_menu_kb())
+    if shopping_text:
+        await message.answer(shopping_text[:3900], reply_markup=main_menu_kb())
 
 def _active_targets(
     *,
@@ -2446,7 +2602,6 @@ async def cmd_plan(message: Message) -> None:
 
 async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int, start_date: dt.date) -> None:
     plan_repo = PlanRepo(db)
-    food_service = FoodService(FoodRepo(db))
     pref_repo = PreferenceRepo(db)
     prefs = await pref_repo.get_json(user.id)
     # store preference
@@ -2482,28 +2637,6 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         "fat_g": int(targ.get("fat_g")) if macros_override else user.fat_g_target,
         "carbs_g": int(targ.get("carbs_g")) if macros_override else user.carbs_g_target,
     }
-
-    def _plan_quality_ok(plan: dict[str, Any], kcal_target: int) -> bool:
-        try:
-            meals = plan.get("meals") or []
-            if not isinstance(meals, list) or not meals:
-                return False
-            for m in meals:
-                prods = (m or {}).get("products") or []
-                if not isinstance(prods, list) or not prods:
-                    return False
-                for p in prods:
-                    if not p or not p.get("name") or float(p.get("grams") or 0) <= 0:
-                        return False
-            totals = plan.get("totals") or {}
-            kcal = totals.get("kcal")
-            if kcal is None:
-                kcal = sum(float((m or {}).get("kcal") or 0) for m in meals)
-            kcal = float(kcal)
-            # within 7%
-            return abs(kcal - float(kcal_target)) <= float(kcal_target) * 0.07
-        except Exception:
-            return False
 
     try:
         day_plans: list[dict[str, Any]] = []
@@ -2570,124 +2703,26 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             plan=plan,
         )
     await db.commit()
+    await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans, prefs=prefs)
 
-    def _norm_name(n: str) -> str:
-        return re.sub(r"\s+", " ", n.strip().lower())
-
-    def _suggest_buy(name: str, grams: float) -> str:
-        n = _norm_name(name)
-        g = max(float(grams), 0.0)
-        # very simple heuristics, labeled as estimate
-        if "яйц" in n:
-            pcs = max(1, int(math.ceil(g / 60.0)))
-            packs = int(math.ceil(pcs / 10.0))
-            return f"Купить: ~{packs}×10 шт (нужно ~{pcs} шт)"
-        step = 100.0
-        if any(k in n for k in ["рис", "паст", "овся", "греч", "мук", "круп", "макарон"]):
-            step = 500.0
-        elif any(k in n for k in ["кур", "индей", "говя", "свини", "рыб", "лосос", "тунец"]):
-            step = 500.0
-        elif any(k in n for k in ["йогур", "творог", "скыр", "сыр", "молок", "кефир"]):
-            step = 200.0
-        buy = int(math.ceil(g / step) * step)
-        packs = int(math.ceil(g / step))
-        return f"Купить: ~{buy:.0f} г ({packs}×{step:.0f} г) — ориентир"
-
-    # aggregate shopping list across days
-    agg: dict[tuple[str, str], float] = {}
-    display: dict[tuple[str, str], str] = {}
-    for plan in day_plans:
-        # some models may forget shopping_list; build fallback from meal products
-        sl = plan.get("shopping_list")
-        if not sl:
-            sl = []
-            for m in (plan.get("meals") or []):
-                for p in (m.get("products") or []):
-                    sl.append(p)
-
-        for it in (sl or []):
-            name = str(it.get("name") or "").strip()
-            store = str(it.get("store") or "").strip() or "Lidl"
-            if store_only:
-                store = store_only
-            grams = float(it.get("grams") or 0)
-            if not name or grams <= 0:
-                continue
-            key = (_norm_name(name), store)
-            agg[key] = agg.get(key, 0.0) + grams
-            display.setdefault(key, name)
-
-    # enrich with images (limit to avoid slow)
-    items_sorted = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
-    shopping_lines: list[str] = []
-    for (norm, store), grams in items_sorted[:25]:
-        orig_name = display.get((norm, store), norm)
-        assets = await food_service.best_product_assets(orig_name, store=store)
-        img_url = assets.get("img_url")
-        off_url = assets.get("off_url")
-        store_url = assets.get("store_url") or make_store_search_url(store, orig_name)
-        best_name = assets.get("best_name")
-        brand = assets.get("brand")
-        search_query = assets.get("search_query")
-        display_name = orig_name
-        # Prefer concrete OFF name (often Czech/Latin) for clarity + matching photos
-        if isinstance(best_name, str) and best_name.strip():
-            display_name = best_name.strip()
-        if isinstance(brand, str) and brand.strip():
-            display_name = f"{brand.strip()} — {display_name}"
-        # If display_name is Cyrillic and we have a better non-cyrillic search_query, prefer it for store URL
-        if _has_cyrillic_text(display_name):
-            sq = assets.get("search_query")
-            if isinstance(sq, str) and sq:
-                store_url = make_store_search_url(store, sq)
-        buy_hint = _suggest_buy(display_name, grams)
-        links: list[str] = []
-        if isinstance(img_url, str) and img_url:
-            links.append(f"<a href=\"{img_url}\">📸 фото</a>")
-        if isinstance(store_url, str) and store_url:
-            links.append(f"<a href=\"{store_url}\">🛒 {store}</a>")
-        if isinstance(off_url, str) and off_url:
-            links.append(f"<a href=\"{off_url}\">🔎 OFF</a>")
-        q_hint = ""
-        if isinstance(search_query, str) and search_query:
-            # Always provide exact query to paste into store site/app search (EAN preferred)
-            q_hint = f" 🔎 запрос: <code>{search_query}</code>"
-        shopping_lines.append(
-            f"- <b>{display_name}</b> — {grams:.0f} г ({store}). {buy_hint}. "
-            + " | ".join(links)
-            + q_hint
+    # enter "plan_edit" mode so the user can iteratively tweak the plan
+    try:
+        user_repo = UserRepo(db)
+        await user_repo.set_dialog(
+            user,
+            state="plan_edit",
+            step=0,
+            data={"start_date": start_date.isoformat(), "days": days},
         )
-
-    parts: list[str] = [f"🍽️ <b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>"]
-    for di, plan in enumerate(day_plans):
-        d = start_date + dt.timedelta(days=di)
-        meals = plan.get("meals") or []
-        totals = plan.get("totals") or {}
-        parts.append(f"\n📅 <b>День {di+1} — {d.isoformat()}</b>")
-        for i, m in enumerate(meals, start=1):
-            tm = str(m.get("time") or "").strip()
-            tm_txt = f"{tm} — " if tm else ""
-            parts.append(
-                f"\n🍽️ <b>{i}. {tm_txt}{m.get('title')}</b>\n"
-                f"🔥 КБЖУ: {m.get('kcal')} ккал | 🥩 Б {m.get('protein_g')} | 🧈 Ж {m.get('fat_g')} | 🍚 У {m.get('carbs_g')}\n"
-                "🧺 Продукты:\n"
-                + "\n".join([f"- {p.get('name')} — {p.get('grams')} г ({p.get('store')})" for p in (m.get('products') or [])])
-                + "\n👨‍🍳 Рецепт:\n"
-                + "\n".join([f"- {s}" for s in (m.get('recipe') or [])])
-            )
-        parts.append(
-            f"\n✅ <b>Итого дня</b>: 🔥 {totals.get('kcal')} ккал | 🥩 {totals.get('protein_g')} | 🧈 {totals.get('fat_g')} | 🍚 {totals.get('carbs_g')}"
+        await db.commit()
+        await message.answer(
+            "🛠️ <b>Правки рациона</b>:\n"
+            "Напиши, что изменить (пример: «замени перекус 09:00 на вариант за рулём»).\n"
+            "Или нажми кнопки ниже 👇",
+            reply_markup=plan_edit_kb(),
         )
-
-    if shopping_lines:
-        shopping_text = "🛒 <b>Список покупок (суммарно)</b>:\n" + "\n".join(shopping_lines)
-    else:
-        shopping_text = ""
-
-    # send plan and shopping list separately to avoid Telegram message truncation
-    await message.answer("\n".join(parts)[:3900], reply_markup=main_menu_kb())
-    if shopping_text:
-        await message.answer(shopping_text[:3900], reply_markup=main_menu_kb())
+    except Exception:
+        pass
 
 
 @router.message(Command("recipe"))
@@ -3251,6 +3286,103 @@ async def any_text(message: Message) -> None:
                 await db.commit()
                 await _generate_plan_for_days(message, db=db, user=user, days=n, start_date=start_date)
                 return
+
+        # plan_edit dialog (iterative tweaks)
+        if user.dialog_state == "plan_edit":
+            t0 = (message.text or "").strip()
+            if t0 in {BTN_PLAN_EDIT_CANCEL, BTN_MENU, BTN_CANCEL, "❌ Отмена"}:
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await message.answer("Ок, закрыл правки. 🧠 Если нужно — снова жми 🗓️ Рацион на день.", reply_markup=main_menu_kb())
+                return
+
+            data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+            try:
+                start_date = dt.date.fromisoformat(str((data or {}).get("start_date")))
+            except Exception:
+                pref_repo = PreferenceRepo(db)
+                prefs = await pref_repo.get_json(user.id)
+                tz = _tz_from_prefs(prefs)
+                start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+            days = int((data or {}).get("days") or 1)
+
+            if t0 == BTN_PLAN_REGEN:
+                await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date)
+                return
+
+            if t0 == BTN_PLAN_APPROVE:
+                plan_repo = PlanRepo(db)
+                for i in range(days):
+                    d = start_date + dt.timedelta(days=i)
+                    p = await plan_repo.get_day_plan_json(user.id, d)
+                    if isinstance(p, dict):
+                        p["_meta"] = {"approved": True, "approved_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()}
+                        await plan_repo.upsert_day_plan(user_id=user.id, date=d, calories_target=None, plan=p)
+                await db.commit()
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await message.answer("✅ Утвердил! План зафиксирован 💪📌\n\nЗавтра можно так же: подкорректируем и утвердим.", reply_markup=main_menu_kb())
+                return
+
+            # Apply memory (so future plans follow new constraints)
+            pref_repo = PreferenceRepo(db)
+            await _apply_coach_memory_if_needed(message, pref_repo=pref_repo, user=user)
+            prefs = await pref_repo.get_json(user.id)
+
+            # Edit day 1 by default; allow "день 2" etc
+            day_idx = 1
+            mday = re.search(r"(?:день|day)\s*(\d+)", _norm_text(t0))
+            if mday:
+                try:
+                    day_idx = max(1, min(int(mday.group(1)), days))
+                except Exception:
+                    day_idx = 1
+            edit_date = start_date + dt.timedelta(days=day_idx - 1)
+
+            plan_repo = PlanRepo(db)
+            current = await plan_repo.get_day_plan_json(user.id, edit_date) or {}
+            active = _active_targets(prefs=prefs, user=user, date_local=edit_date)
+            kcal_target = int(active.get("kcal") or user.calories_target or 0)
+            if kcal_target <= 0:
+                await message.answer("Не вижу целевую норму калорий. Открой 👤 Профиль и зафиксируй цели.", reply_markup=main_menu_kb())
+                return
+
+            store_only = str(prefs.get("preferred_store") or "any")
+            store_line = "" if store_only.lower() == "any" else f"Покупка только в магазине: {store_only}."
+
+            # Ask model to patch the plan
+            last_plan: dict[str, Any] | None = None
+            for attempt in range(2):
+                extra = "" if attempt == 0 else "\nВАЖНО: прошлый вариант не попал в цели ккал/продукты. Исправь и пересчитай."
+                patched = await text_json(
+                    system=f"{SYSTEM_COACH}\n\n{PLAN_EDIT_JSON}",
+                    user=(
+                        _profile_context(user)
+                        + "\nПредпочтения/режим дня (из БД):\n"
+                        + dumps(prefs)
+                        + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
+                        + store_line
+                        + f"\nТекущий план на {edit_date.isoformat()}:\n"
+                        + dumps(current)
+                        + "\n\nПросьба пользователя:\n"
+                        + t0
+                        + extra
+                    ),
+                    max_output_tokens=1500,
+                )
+                if isinstance(patched, dict):
+                    last_plan = patched
+                    if _plan_quality_ok(patched, kcal_target):
+                        break
+            new_plan = last_plan or current
+            await plan_repo.upsert_day_plan(user_id=user.id, date=edit_date, calories_target=kcal_target, plan=new_plan)
+            await db.commit()
+
+            # Reload all days and show updated plan + shopping list
+            day_plans = await _load_day_plans(plan_repo=plan_repo, user_id=user.id, start_date=start_date, days=days)
+            await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans, prefs=prefs)
+            await message.answer("🛠️ Ок! Поменял. Хочешь ещё правки? Пиши текстом или жми ✅ Утвердить.", reply_markup=plan_edit_kb())
+            return
 
         # Agent router (free-form commands)
         user_text = (message.text or "").strip()
