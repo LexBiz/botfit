@@ -148,9 +148,10 @@ DAY_PLAN_JSON = """
   "meals": [
     {
       "time": string,
-      "title": string,
-      "products": [{"name": string, "grams": number, "store": string}],
-      "recipe": [string, ...],
+      "title_ru": string,
+      "title_cz": string,
+      "products": [{"name_ru": string, "name_cz": string, "grams": number}],
+      "recipe_ru": [string, ...],
       "kcal": number,
       "protein_g": number,
       "fat_g": number,
@@ -158,11 +159,11 @@ DAY_PLAN_JSON = """
     }
   ],
   "totals": {"kcal": number, "protein_g": number, "fat_g": number, "carbs_g": number},
-  "shopping_list": [{"name": string, "grams": number, "store": string}]
+  "shopping_list": [{"name_ru": string, "name_cz": string, "grams": number}]
 }
-Условия: страна Чехия, магазины только Lidl/Kaufland/Albert/PENNY. Продукты реальные и типовые для этих магазинов.
-ВАЖНО: названия продуктов и блюд пиши ТОЛЬКО латиницей или по‑чешски (никакой кириллицы), чтобы поиски в магазинах работали.
-ВАЖНО: recipe должен быть подробный: 6–10 шагов, с временем/температурой где уместно, без воды, чтобы реально можно было приготовить.
+Условия: страна Чехия. Продукты реальные и типовые для Чехии.
+ВАЖНО: в title/products/shopping_list верни ДВА языка: русский (ru) + чешский (cz).
+ВАЖНО: recipe_ru должен быть подробный: 6–10 шагов, с временем/температурой где уместно, без воды, чтобы реально можно было приготовить.
 ВАЖНО: не используй спортпит/протеин-порошок/whey/шейки/гейнеры/предтрен, если пользователь явно не просил. Белок добирай едой (skyr/tvaroh/maso/ryby/vejce/luštěniny).
 """.strip()
 

@@ -35,7 +35,6 @@ from src.prompts import (
     MEAL_ITEMS_JSON,
     MEAL_FROM_PHOTO_FINAL_JSON,
     MEAL_FROM_TEXT_JSON,
-    PLAN_EDIT_JSON,
     PHOTO_ANALYSIS_JSON,
     PHOTO_TO_ITEMS_JSON,
     ROUTER_JSON,
@@ -44,10 +43,8 @@ from src.prompts import (
     WEEKLY_ANALYSIS_JSON,
 )
 from src.food_service import FoodService, compute_item_macros
-from src.food_service import make_store_search_url
 from src.keyboards import (
     BTN_CANCEL,
-    BTN_COACH,
     BTN_DAYS_1,
     BTN_DAYS_3,
     BTN_DAYS_7,
@@ -70,18 +67,7 @@ from src.keyboards import (
     goal_tempo_kb,
     main_menu_kb,
     plan_days_kb,
-    plan_edit_kb,
-    plan_store_kb,
-    plan_when_kb,
     cancel_kb,
-    BTN_STORE_ALBERT,
-    BTN_STORE_ANY,
-    BTN_STORE_KAUFLAND,
-    BTN_STORE_LIDL,
-    BTN_STORE_PENNY,
-    BTN_PLAN_APPROVE,
-    BTN_PLAN_REGEN,
-    BTN_PLAN_EDIT_CANCEL,
     targets_mode_kb,
 )
 from src.render import recipe_table
@@ -253,19 +239,15 @@ def _escape_html(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _normalize_day_plan(plan: dict[str, Any], *, store_only: str | None) -> dict[str, Any]:
+def _normalize_day_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """
     Make the day plan more tolerant to slightly-off model JSON.
     - Coerce numeric fields from strings ("120 г" -> 120.0)
     - Ensure required structures are lists/dicts where possible
-    - Enforce store_only if provided (do not persist; only for this plan output)
+    Supports both legacy schema (name/store/recipe) and new bilingual schema (name_ru/name_cz).
     """
     if not isinstance(plan, dict):
         return {}
-
-    so = (store_only or "").strip()
-    if so.lower() == "any":
-        so = ""
 
     meals = plan.get("meals")
     if not isinstance(meals, list):
@@ -282,31 +264,36 @@ def _normalize_day_plan(plan: dict[str, Any], *, store_only: str | None) -> dict
         for p in prods:
             if not isinstance(p, dict):
                 continue
-            name = str(p.get("name") or "").strip()
             grams = _coerce_number(p.get("grams"))
-            if not name or grams is None or grams <= 0:
+            if grams is None or grams <= 0:
                 continue
-            store = str(p.get("store") or "").strip()
-            if so:
-                store = so
-            if not store:
-                store = "Lidl"
-            norm_prods.append({"name": name, "grams": float(grams), "store": store})
+            # new schema (preferred)
+            name_ru = str(p.get("name_ru") or "").strip()
+            name_cz = str(p.get("name_cz") or "").strip()
+            # legacy schema fallback
+            if not name_ru and isinstance(p.get("name"), str):
+                name_cz = str(p.get("name") or "").strip()
+            if not name_cz and isinstance(p.get("name"), str):
+                name_ru = str(p.get("name") or "").strip()
+            if not (name_ru or name_cz):
+                continue
+            norm_prods.append({"name_ru": name_ru, "name_cz": name_cz, "grams": float(grams)})
 
         kcal = _coerce_number(m.get("kcal"))
         prot = _coerce_number(m.get("protein_g"))
         fat = _coerce_number(m.get("fat_g"))
         carbs = _coerce_number(m.get("carbs_g"))
-        recipe = m.get("recipe")
+        recipe = m.get("recipe_ru") if isinstance(m.get("recipe_ru"), list) else m.get("recipe")
         if not isinstance(recipe, list):
             recipe = []
         recipe2 = [str(x).strip() for x in recipe if str(x or "").strip()]
 
         nm: dict[str, Any] = {
             "time": str(m.get("time") or "").strip(),
-            "title": str(m.get("title") or "").strip(),
+            "title_ru": str(m.get("title_ru") or "").strip() or str(m.get("title") or "").strip(),
+            "title_cz": str(m.get("title_cz") or "").strip() or "",
             "products": norm_prods,
-            "recipe": recipe2,
+            "recipe_ru": recipe2,
         }
         if kcal is not None:
             nm["kcal"] = float(kcal)
@@ -343,21 +330,23 @@ def _normalize_day_plan(plan: dict[str, Any], *, store_only: str | None) -> dict
     for it in sl:
         if not isinstance(it, dict):
             continue
-        name = str(it.get("name") or "").strip()
         grams = _coerce_number(it.get("grams"))
-        if not name or grams is None or grams <= 0:
+        if grams is None or grams <= 0:
             continue
-        store = str(it.get("store") or "").strip()
-        if so:
-            store = so
-        if not store:
-            store = "Lidl"
-        norm_sl.append({"name": name, "grams": float(grams), "store": store})
+        name_ru = str(it.get("name_ru") or "").strip()
+        name_cz = str(it.get("name_cz") or "").strip()
+        if not name_ru and isinstance(it.get("name"), str):
+            name_cz = str(it.get("name") or "").strip()
+        if not name_cz and isinstance(it.get("name"), str):
+            name_ru = str(it.get("name") or "").strip()
+        if not (name_ru or name_cz):
+            continue
+        norm_sl.append({"name_ru": name_ru, "name_cz": name_cz, "grams": float(grams)})
     if not norm_sl:
         for mm in norm_meals:
             for pp in (mm.get("products") or []):
                 if isinstance(pp, dict):
-                    norm_sl.append(pp)
+                    norm_sl.append({"name_ru": str(pp.get("name_ru") or ""), "name_cz": str(pp.get("name_cz") or ""), "grams": float(pp.get("grams") or 0)})
 
     return {"meals": norm_meals, "totals": norm_totals, "shopping_list": norm_sl}
 
@@ -374,19 +363,23 @@ def _plan_quality_ok(plan: dict[str, Any], kcal_target: int) -> bool:
             if not isinstance(prods, list) or not prods:
                 return False
             for p in prods:
-                name = str((p or {}).get("name") or "").strip()
+                name = str((p or {}).get("name_cz") or (p or {}).get("name_ru") or "").strip()
                 grams = _coerce_number((p or {}).get("grams"))
                 if not name or grams is None or grams <= 0:
                     return False
-                low = name.lower()
+                low = (name or "").lower()
+                low2 = str((p or {}).get("name_ru") or "").lower()
                 if any(b in low for b in banned):
+                    return False
+                if any(b in low2 for b in banned):
                     return False
         totals = plan.get("totals") or {}
         kcal = _coerce_number(totals.get("kcal"))
         if kcal is None:
             kcal = sum(float(_coerce_number((m or {}).get("kcal")) or 0) for m in meals)
         kcal = float(kcal or 0)
-        return abs(kcal - float(kcal_target)) <= float(kcal_target) * 0.07
+        # allow a bit more tolerance; the model is forced to use real foods + recipes
+        return abs(kcal - float(kcal_target)) <= float(kcal_target) * 0.12
     except Exception:
         return False
 
@@ -407,103 +400,90 @@ async def _send_plans(
     user: Any,
     start_date: dt.date,
     day_plans: list[dict[str, Any]],
-    store_only: str | None,
 ) -> None:
-    food_service = FoodService(FoodRepo(db))
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-    def _norm_name(n: str) -> str:
-        return re.sub(r"\s+", " ", n.strip().lower())
-
-    def _suggest_buy(name: str, grams: float) -> str:
-        n = _norm_name(name)
-        g = max(float(grams), 0.0)
-        if "яйц" in n:
-            pcs = max(1, int(math.ceil(g / 60.0)))
-            packs = int(math.ceil(pcs / 10.0))
-            return f"Купить: ~{packs}×10 шт (нужно ~{pcs} шт)"
-        step = 100.0
-        if any(k in n for k in ["рис", "паст", "овся", "греч", "мук", "круп", "макарон"]):
-            step = 500.0
-        elif any(k in n for k in ["кур", "индей", "говя", "свини", "рыб", "лосос", "тунец"]):
-            step = 500.0
-        elif any(k in n for k in ["йогур", "творог", "скыр", "сыр", "молок", "кефир"]):
-            step = 200.0
-        buy = int(math.ceil(g / step) * step)
-        packs = int(math.ceil(g / step))
-        return f"Купить: ~{buy:.0f} г ({packs}×{step:.0f} г) — ориентир"
-
-    # aggregate shopping list across days
-    if store_only:
-        store_only = str(store_only).strip() or None
-        if store_only and store_only.lower() == "any":
-            store_only = None
-
+    # aggregate shopping list across days (bilingual)
     agg: dict[tuple[str, str], float] = {}
-    display: dict[tuple[str, str], str] = {}
+    disp: dict[tuple[str, str], tuple[str, str]] = {}
     for plan in day_plans:
-        sl = plan.get("shopping_list")
-        if not sl:
+        sl = plan.get("shopping_list") or []
+        if not isinstance(sl, list) or not sl:
             sl = []
             for m in (plan.get("meals") or []):
                 for p in (m.get("products") or []):
                     sl.append(p)
-        for it in (sl or []):
-            name = str(it.get("name") or "").strip()
-            store = str(it.get("store") or "").strip() or "Lidl"
-            if store_only:
-                store = store_only
-            grams = float(it.get("grams") or 0)
-            if not name or grams <= 0:
+        for it in sl:
+            if not isinstance(it, dict):
                 continue
-            key = (_norm_name(name), store)
-            agg[key] = agg.get(key, 0.0) + grams
-            display.setdefault(key, name)
+            grams = _coerce_number(it.get("grams")) or 0
+            if grams <= 0:
+                continue
+            name_ru = str(it.get("name_ru") or "").strip()
+            name_cz = str(it.get("name_cz") or "").strip()
+            if not (name_ru or name_cz):
+                continue
+            key = (_norm(name_ru), _norm(name_cz))
+            agg[key] = agg.get(key, 0.0) + float(grams)
+            disp.setdefault(key, (name_ru, name_cz))
 
-    items_sorted = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
     shopping_lines: list[str] = []
-    for (norm, store), grams in items_sorted[:25]:
-        orig_name = display.get((norm, store), norm)
-        # Speed/UX: user asked we can drop photo/OFF lookups. Keep only store search link + grams.
-        display_name = orig_name
-        store_url = make_store_search_url(store, orig_name)
-        search_query = orig_name
-        buy_hint = _suggest_buy(display_name, grams)
-        links: list[str] = []
-        if isinstance(store_url, str) and store_url:
-            links.append(f"<a href=\"{store_url}\">🛒 {store}</a>")
-        q_hint = f" 🔎 запрос: <code>{search_query}</code>" if isinstance(search_query, str) and search_query else ""
-        shopping_lines.append(f"- <b>{display_name}</b> — {grams:.0f} г ({store}). {buy_hint}. " + " | ".join(links) + q_hint)
+    for (kru, kcz), grams in sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:30]:
+        nru, ncz = disp.get((kru, kcz), (kru, kcz))
+        name_txt = (f"<b>{nru}</b>" if nru else f"<b>{ncz}</b>") + (f" / <i>{ncz}</i>" if nru and ncz else "")
+        shopping_lines.append(f"- {name_txt} — {grams:.0f} г")
 
+    # render plan lines (bilingual)
     days = len(day_plans)
-    parts: list[str] = [f"🍽️ <b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>"]
+    lines: list[str] = []
     for di, plan in enumerate(day_plans):
         d = start_date + dt.timedelta(days=di)
         meals = plan.get("meals") or []
         totals = plan.get("totals") or {}
-        parts.append(f"\n📅 <b>День {di+1} — {d.isoformat()}</b>")
+        lines.append(f"\n📅 <b>День {di+1} — {d.isoformat()}</b>")
         for i, m in enumerate(meals, start=1):
-            tm = str(m.get("time") or "").strip()
-            tm_txt = f"{tm} — " if tm else ""
-            parts.append(
-                f"\n🍽️ <b>{i}. {tm_txt}{m.get('title')}</b>\n"
-                f"🔥 КБЖУ: {m.get('kcal')} ккал | 🥩 Б {m.get('protein_g')} | 🧈 Ж {m.get('fat_g')} | 🍚 У {m.get('carbs_g')}\n"
-                "🧺 Продукты:\n"
-                + "\n".join([f"- {p.get('name')} — {p.get('grams')} г ({p.get('store')})" for p in (m.get("products") or [])])
-                + "\n👨‍🍳 Рецепт:\n"
-                + "\n".join([f"- {s}" for s in (m.get("recipe") or [])])
-            )
-        parts.append(
-            f"\n✅ <b>Итого дня</b>: 🔥 {totals.get('kcal')} ккал | 🥩 {totals.get('protein_g')} | 🧈 {totals.get('fat_g')} | 🍚 {totals.get('carbs_g')}"
+            tm = str((m or {}).get("time") or "").strip()
+            title_ru = str((m or {}).get("title_ru") or "").strip()
+            title_cz = str((m or {}).get("title_cz") or "").strip()
+            title_txt = (title_ru or title_cz or "Приём пищи") + (f" / {title_cz}" if title_ru and title_cz else "")
+            kcal = (m or {}).get("kcal")
+            p = (m or {}).get("protein_g")
+            f = (m or {}).get("fat_g")
+            c = (m or {}).get("carbs_g")
+            lines.append(f"🍽️ <b>{i}. {tm + ' — ' if tm else ''}{title_txt}</b>")
+            lines.append(f"🔥 КБЖУ: {kcal} ккал | 🥩 Б {p} | 🧈 Ж {f} | 🍚 У {c}")
+            prods = (m or {}).get("products") or []
+            if isinstance(prods, list) and prods:
+                lines.append("🧺 Продукты:")
+                for pp in prods:
+                    if not isinstance(pp, dict):
+                        continue
+                    nru = str(pp.get("name_ru") or "").strip()
+                    ncz = str(pp.get("name_cz") or "").strip()
+                    g = _coerce_number(pp.get("grams")) or 0
+                    nm = (nru or ncz) + (f" / {ncz}" if nru and ncz else "")
+                    lines.append(f"- {nm} — {g:.0f} г")
+            rec = (m or {}).get("recipe_ru") or []
+            if isinstance(rec, list) and rec:
+                lines.append("👨‍🍳 Рецепт:")
+                for s in rec[:12]:
+                    st = str(s or "").strip()
+                    if st:
+                        lines.append(f"- {st}")
+            lines.append("")  # spacer
+        lines.append(
+            f"✅ <b>Итого дня</b>: 🔥 {totals.get('kcal')} ккал | 🥩 {totals.get('protein_g')} | 🧈 {totals.get('fat_g')} | 🍚 {totals.get('carbs_g')}"
         )
 
-    await message.answer("\n".join(parts)[:3900], reply_markup=main_menu_kb())
+    await _send_html_lines(
+        message,
+        header=f"🍽️ <b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>",
+        lines=lines,
+        reply_markup=main_menu_kb(),
+    )
     if shopping_lines:
-        await _send_html_lines(
-            message,
-            header="🛒 <b>Список покупок (суммарно)</b>:",
-            lines=shopping_lines,
-            reply_markup=main_menu_kb(),
-        )
+        await _send_html_lines(message, header="🛒 <b>Список покупок (суммарно)</b>:", lines=shopping_lines, reply_markup=main_menu_kb())
 
 def _active_targets(
     *,
@@ -723,7 +703,7 @@ async def cmd_profile(message: Message) -> None:
             f"🔥 Калории: <b>{active.get('kcal')}</b> ккал\n"
             f"🥩🧈🍚 БЖУ: <b>{active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')} г</b>\n"
             f"🧠 Источник: <b>{'custom' if active.get('source')=='custom' else 'coach'}</b>\n"
-            f"🛒 Магазин: <b>{active.get('store')}</b>\n\n"
+            "\n"
             "🧮 <b>Расчёт тренера (справочно)</b>\n"
             f"⚡ TDEE: <b>{meta.tdee_kcal} ккал</b>\n"
             f"📉 Дефицит: <b>{meta.deficit_kcal} ккал/день</b> ({_fmt_pct(meta.deficit_pct)})\n"
@@ -740,8 +720,7 @@ async def cmd_help(message: Message) -> None:
         "- /start — анкета и расчет нормы\n"
         "- /profile — профиль и текущая норма\n"
         "- /weight 82.5 — обновить вес и пересчитать\n"
-        "- /plan — рацион на день (Чехия: Lidl/Kaufland/Albert)\n"
-        "- 🧠 AI Тренер — режим ведения (вопросы/дисциплина/график)\n"
+        "- /plan — рацион (Чехия, без выбора магазинов)\n"
         "- /week — анализ дневника за 7 дней\n"
         "- /recipe — расчет рецепта по ингредиентам (КБЖУ)\n"
         "- /reset — сброс профиля"
@@ -2247,7 +2226,7 @@ def _pick_meal_from_plan(plan: dict[str, Any], slot: str | None) -> dict[str, An
     }.get(slot, [])
     if kw:
         for m in meals:
-            title = str((m or {}).get("title") or "").lower()
+            title = str((m or {}).get("title_ru") or (m or {}).get("title") or "").lower()
             if any(k in title for k in kw):
                 return m
 
@@ -2290,14 +2269,26 @@ async def _handle_recall_plan(message: Message, *, plan_repo: PlanRepo, user: An
         await message.answer("Не смог найти прием пищи в плане. Можешь сгенерировать план заново: 🗓️ Рацион на день.")
         return True
 
-    title = str(m.get("title") or "Прием пищи")
+    title = str(m.get("title_ru") or m.get("title") or "Прием пищи")
+    title_cz = str(m.get("title_cz") or "").strip()
     tm = str(m.get("time") or "").strip()
     products = m.get("products") or []
-    recipe = m.get("recipe") or []
+    recipe = m.get("recipe_ru") or m.get("recipe") or []
 
     text = (
-        f"<b>{'Сегодня' if today else ''} {tm + ' — ' if tm else ''}{title}</b>\n\n"
-        + ("<b>Продукты</b>:\n" + "\n".join([f"- {p.get('name')} — {p.get('grams')} г ({p.get('store')})" for p in products]) + "\n\n" if products else "")
+        f"<b>{'Сегодня' if today else ''} {tm + ' — ' if tm else ''}{title}{' / ' + title_cz if title_cz else ''}</b>\n\n"
+        + (
+            "<b>Продукты</b>:\n"
+            + "\n".join(
+                [
+                    f"- {(p.get('name_ru') or p.get('name'))}{(' / ' + str(p.get('name_cz'))) if p.get('name_cz') else ''} — {p.get('grams')} г"
+                    for p in products
+                ]
+            )
+            + "\n\n"
+            if products
+            else ""
+        )
         + ("<b>Рецепт</b>:\n" + "\n".join([f"- {s}" for s in recipe]) if recipe else "")
     )
     await message.answer(text[:3900], reply_markup=main_menu_kb())
@@ -2802,33 +2793,36 @@ async def cmd_plan(message: Message) -> None:
 
     async with SessionLocal() as db:
         user_repo = UserRepo(db)
+        pref_repo = PreferenceRepo(db)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
         if not user.profile_complete:
             await message.answer("Сначала заполним профиль: /start")
             return
 
-        # Keep /plan interactive (date -> store -> days), but allow /plan N to prefill days.
+        # New flow: /plan -> choose days (1/3/7). Start date is tomorrow (local tz).
         days_prefill: int | None = None
         if message.text:
             parts = message.text.strip().split()
             if len(parts) >= 2 and parts[1].isdigit():
                 days_prefill = max(1, min(int(parts[1]), 7))
 
-        await user_repo.set_dialog(user, state="plan_when", step=0, data={"days_prefill": days_prefill} if days_prefill else None)
+        prefs = await pref_repo.get_json(user.id)
+        tz = _tz_from_prefs(prefs)
+        today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+        start_date = today_local + dt.timedelta(days=1)
+        data: dict[str, Any] = {"start_date": start_date.isoformat()}
+        if days_prefill:
+            data["days_prefill"] = days_prefill
+        await user_repo.set_dialog(user, state="plan_days", step=0, data=data)
         await db.commit()
-        await message.answer("📅 На какой день сделать рацион?", reply_markup=plan_when_kb())
+        await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b>\nНа сколько дней? (1/3/7)", reply_markup=plan_days_kb())
         return
 
 
-async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int, start_date: dt.date, store_only: str | None) -> None:
+async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int, start_date: dt.date) -> None:
     plan_repo = PlanRepo(db)
     pref_repo = PreferenceRepo(db)
     prefs = await pref_repo.get_json(user.id)
-    # store constraint is per-generation (do NOT persist as user preference)
-    if store_only:
-        store_only = str(store_only).strip() or None
-        if store_only and store_only.lower() == "any":
-            store_only = None
 
     # choose target kcal/macros: prefer explicit targets from prefs (incl weekday/weekend)
     targ = prefs.get("targets") if isinstance(prefs.get("targets"), dict) else {}
@@ -2873,23 +2867,25 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             # retry if model doesn't match targets or returns invalid JSON
             last_plan: dict[str, Any] | None = None
             last_err: Exception | None = None
-            store_line = (
-                f"\nВАЖНО: покупка только в магазине: <b>{store_only}</b>. Все products[*].store и shopping_list[*].store должны быть строго '{store_only}'."
-                if store_only
-                else ""
-            )
+            # Use user's routine if present
+            mt = prefs.get("meal_times") if isinstance(prefs.get("meal_times"), list) else None
+            meal_times = [t for t in (mt or []) if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip())][:8]
+            routine_line = ""
+            if meal_times:
+                routine_line = "\nРежим пользователя: используй эти времена приёмов пищи (строго): " + ", ".join(meal_times) + "."
             user_prompt = (
                 _profile_context(user)
                 + "\nПредпочтения/режим дня (из БД):\n"
                 + dumps(prefs)
                 + f"\nСоставь рацион на {d.isoformat()} на <b>{kcal_target} ккал</b>.\n"
                 + macro_line
-                + store_line
+                + routine_line
                 + "Требования:\n"
-                + "- Сумма за день должна попасть в цель (допуск ±5%).\n"
-                + "- Продукты реальные и типовые для Чехии (Lidl/Kaufland/Albert/PENNY).\n"
+                + "- Страна: Чехия.\n"
+                + "- Сумма за день должна попасть в цель (допуск ±7%).\n"
                 + "- В каждом приёме пищи обязателен список продуктов с граммами.\n"
-                + "- shopping_list обязателен.\n"
+                + "- ВАЖНО: в продуктах и названиях дай 2 языка: русский + чешский.\n"
+                + "- shopping_list обязателен и тоже (русский + чешский).\n"
                 + "- Никаких спорт-добавок (whey/протеин/креатин/гейнер).\n"
             )
 
@@ -2922,7 +2918,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                 if not isinstance(plan_raw, dict):
                     last_err = RuntimeError("Plan JSON is not an object")
                     continue
-                plan = _normalize_day_plan(plan_raw, store_only=store_only)
+                plan = _normalize_day_plan(plan_raw)
                 last_plan = plan
                 if _plan_quality_ok(plan, kcal_target):
                     break
@@ -2939,11 +2935,10 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             print(traceback.format_exc())
         except Exception:
             pass
-        # Do NOT send low-quality plain-text plans (they break store constraints and product clarity).
-        # Instead, keep user in "plan_edit" mode with a clear retry action.
+        # Reset dialog state on failure
         try:
             user_repo = UserRepo(db)
-            await user_repo.set_dialog(user, state="plan_edit", step=0, data={"start_date": start_date.isoformat(), "days": days, "store_only": store_only or "any"})
+            await user_repo.set_dialog(user, state=None, step=None, data=None)
             await db.commit()
         except Exception:
             pass
@@ -2951,9 +2946,9 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         err_snip = _escape_html(err_snip[:180]) if err_snip else ""
         await message.answer(
             "⚠️ Не смог собрать качественный рацион (ошибка генерации).\n\n"
-            "Жми <b>🔁 Пересобрать рацион</b> — я сделаю новый вариант строго под выбранный магазин и твой КБЖУ.\n"
+            "Попробуй ещё раз: нажми 🗓️ <b>Рацион на день</b>.\n"
             f"Тех.деталь: <code>{type(e).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
-            reply_markup=plan_edit_kb(),
+            reply_markup=main_menu_kb(),
         )
         return
 
@@ -2968,35 +2963,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             plan=plan,
         )
     await db.commit()
-    await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans, store_only=store_only)
-
-    # enter "plan_edit" mode so the user can iteratively tweak the plan
-    try:
-        user_repo = UserRepo(db)
-        await user_repo.set_dialog(
-            user,
-            state="plan_edit",
-            step=0,
-            data={"start_date": start_date.isoformat(), "days": days, "store_only": store_only or "any"},
-        )
-        await db.commit()
-        await message.answer(
-            "🛠️ <b>Правки рациона</b>:\n"
-            "Напиши, что изменить (пример: «замени перекус 09:00 на вариант за рулём»).\n"
-            "Или нажми кнопки ниже 👇",
-            reply_markup=plan_edit_kb(),
-        )
-    except Exception:
-        pass
-
-    # clear generating state if still set
-    try:
-        user_repo = UserRepo(db)
-        if user.dialog_state == "plan_generating":
-            await user_repo.set_dialog(user, state="plan_edit", step=0, data={"start_date": start_date.isoformat(), "days": days, "store_only": store_only or "any"})
-            await db.commit()
-    except Exception:
-        pass
+    await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans)
 
 
 @router.message(Command("recipe"))
@@ -3268,24 +3235,15 @@ async def any_text(message: Message) -> None:
         if t in {BTN_PROFILE}:
             await cmd_profile(message)
             return
-        if t in {BTN_COACH}:
-            # short intake -> then coach builds plan/discipline/schedule
-            await user_repo.set_dialog(user, state="coach_intake", step=0, data=None)
-            await db.commit()
-            await message.answer(
-                "🧠 <b>AI Тренер</b>\n\n"
-                "⚡️ 3 пункта, чтобы я вёл тебя чётко:\n"
-                "🍚 <b>Тренировочный день</b>: угли не режем ниже плана — иначе сила/прогресс просядут.\n"
-                "😴 <b>Сон/режим</b>: отбой 21:30 — держим, это критично (особенно на hard‑режиме).\n"
-                "📌 <b>Дальше</b>: отвечай на 2 вопроса — и я соберу план по рациону/дисциплине/графику.\n\n"
-                "❓ <b>1/2</b> Во сколько завтра тренировка и какая: силовая/кардио/смешанная?",
-                reply_markup=cancel_kb(),
-            )
-            return
         if t in {BTN_PLAN}:
-            await user_repo.set_dialog(user, state="plan_when", step=0, data=None)
+            pref_repo = PreferenceRepo(db)
+            prefs = await pref_repo.get_json(user.id)
+            tz = _tz_from_prefs(prefs)
+            today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+            start_date = today_local + dt.timedelta(days=1)
+            await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat()})
             await db.commit()
-            await message.answer("📅 На какой день сделать рацион?", reply_markup=plan_when_kb())
+            await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b>\nНа сколько дней? (1/3/7)", reply_markup=plan_days_kb())
             return
         if t in {BTN_WEEK}:
             await cmd_week(message)
@@ -3342,129 +3300,6 @@ async def any_text(message: Message) -> None:
             await db.commit()
             if not handled:
                 await message.answer("Не понял напоминания. Напиши проще (время + что спрашивать).", reply_markup=main_menu_kb())
-            return
-
-        # AI coach intake dialog (2 questions)
-        if user.dialog_state == "coach_intake":
-            t0 = (message.text or "").strip()
-            if t0 in {"❌ Отмена", BTN_CANCEL, BTN_MENU}:
-                await user_repo.set_dialog(user, state=None, step=None, data=None)
-                await db.commit()
-                await message.answer("Ок, вышел из AI‑тренера. Если нужно — снова жми 🧠 AI Тренер.", reply_markup=main_menu_kb())
-                return
-
-            step = int(user.dialog_step or 0)
-            data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-            data = data if isinstance(data, dict) else {}
-
-            if step <= 0:
-                data["tomorrow_training"] = t0
-                await user_repo.set_dialog(user, state="coach_intake", step=1, data=data)
-                await db.commit()
-                await message.answer(
-                    "❓ <b>2/2</b> Завтра ты хочешь 3 приёма (05:30/09:00/11:00) + перекусы,\n"
-                    "или будет ещё ужин после работы? (и во сколько примерно)",
-                    reply_markup=cancel_kb(),
-                )
-                return
-
-            # step 1 -> finalize and answer
-            data["tomorrow_meals"] = t0
-            await user_repo.set_dialog(user, state=None, step=None, data=None)
-            await db.commit()
-
-            # persist as preference note so coach can reference it later
-            try:
-                pref_repo = PreferenceRepo(db)
-                await pref_repo.merge(
-                    user.id,
-                    {
-                        "coach_intake": {
-                            "tomorrow_training": str(data.get("tomorrow_training") or "").strip(),
-                            "tomorrow_meals": str(data.get("tomorrow_meals") or "").strip(),
-                            "captured_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-                        }
-                    },
-                )
-                await db.commit()
-            except Exception:
-                pass
-
-            q = (
-                "Собери мне план на завтра: рацион (под мои цели), дисциплина/режим и график.\n"
-                f"Тренировка: {data.get('tomorrow_training')}\n"
-                f"Питание/время: {data.get('tomorrow_meals')}\n"
-                "Если нужно — предложи 1-2 уточнения. Потом дай чёткий план по пунктам."
-            )
-
-            pref_repo = PreferenceRepo(db)
-            plan_repo = PlanRepo(db)
-            note_repo = CoachNoteRepo(db)
-            prefs = await pref_repo.get_json(user.id)
-            today_plan = await plan_repo.get_day_plan_json(user.id, dt.date.today())
-            recent_notes = await note_repo.last_notes(user.id, limit=20)
-            last_meals = await meal_repo.last_meals(user.id, limit=12)
-            meals_json = [
-                {
-                    "created_at": m.created_at.isoformat(),
-                    "source": m.source,
-                    "calories": m.calories,
-                    "protein_g": m.protein_g,
-                    "fat_g": m.fat_g,
-                    "carbs_g": m.carbs_g,
-                    "description_raw": m.description_raw,
-                }
-                for m in last_meals
-            ]
-            try:
-                deficit_pct = prefs.get("deficit_pct")
-                _, meta = compute_targets_with_meta(
-                    sex=user.sex,  # type: ignore[arg-type]
-                    age=user.age,
-                    height_cm=user.height_cm,
-                    weight_kg=user.weight_kg,
-                    activity=user.activity_level,  # type: ignore[arg-type]
-                    goal=user.goal,  # type: ignore[arg-type]
-                    deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
-                )
-                calc_meta = {"bmr_kcal": meta.bmr_kcal, "tdee_kcal": meta.tdee_kcal, "deficit_pct": meta.deficit_pct, "deficit_kcal": meta.deficit_kcal}
-            except Exception:
-                calc_meta = None
-
-            ctx = {
-                "profile": {
-                    "age": user.age,
-                    "sex": user.sex,
-                    "height_cm": user.height_cm,
-                    "weight_kg": user.weight_kg,
-                    "activity_level": user.activity_level,
-                    "goal": user.goal,
-                    "calories_target": user.calories_target,
-                    "macros_target": [user.protein_g_target, user.fat_g_target, user.carbs_g_target],
-                },
-                "calc_meta": calc_meta,
-                "preferences": prefs,
-                "today_plan": today_plan,
-                "recent_meals": meals_json,
-                "coach_notes": recent_notes,
-            }
-
-            try:
-                ans = await text_output(
-                    system=f"{SYSTEM_COACH}\n\n{COACH_CHAT_GUIDE}",
-                    user="Контекст (из БД):\n" + dumps(ctx) + "\n\nЗапрос пользователя:\n" + q,
-                    max_output_tokens=900,
-                )
-                out = _safe_nonempty_text(_sanitize_ai_text(ans), fallback="⚠️ Похоже, ответ получился пустым. Попробуй ещё раз.")
-                await _safe_answer_html(message, out, reply_markup=main_menu_kb())
-            except Exception as e:
-                err_snip = _scrub_secrets(str(e)).strip()
-                err_snip = _escape_html(err_snip[:180]) if err_snip else ""
-                await message.answer(
-                    "⚠️ Сейчас не могу собрать план тренера (ошибка AI).\n"
-                    f"Тех.деталь: <code>{type(e).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
-                    reply_markup=main_menu_kb(),
-                )
             return
 
         # progress mode dialog (text only; photos handled in photo handler)
@@ -3573,8 +3408,8 @@ async def any_text(message: Message) -> None:
             )
             return
 
-        # plan dialogs (date + days)
-        if user.dialog_state in {"plan_when", "plan_date", "plan_store", "plan_days"}:
+        # plan dialog (days only)
+        if user.dialog_state == "plan_days":
             if t in {BTN_CANCEL, "❌ Отмена", BTN_MENU}:
                 await user_repo.set_dialog(user, state=None, step=None, data=None)
                 await db.commit()
@@ -3586,312 +3421,45 @@ async def any_text(message: Message) -> None:
             tz = _tz_from_prefs(prefs)
             today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
 
-            if user.dialog_state == "plan_when":
-                # keep any prefills (e.g. /plan N)
-                try:
-                    prev_data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-                except Exception:
-                    prev_data = {}
-
-                t_norm = _norm_text(t)
-                # accept free-form text too
-                if t == BTN_PLAN_TODAY or "сегодня" in t_norm:
-                    start_date = today_local
-                elif t == BTN_PLAN_TOMORROW or "завтра" in t_norm:
-                    start_date = today_local + dt.timedelta(days=1)
-                elif t == BTN_PLAN_AFTER_TOMORROW or "послезавтра" in t_norm:
-                    start_date = today_local + dt.timedelta(days=2)
-                elif t == BTN_PLAN_OTHER_DATE:
-                    keep = prev_data if isinstance(prev_data, dict) and prev_data else None
-                    await user_repo.set_dialog(user, state="plan_date", step=0, data=keep)
-                    await db.commit()
-                    await message.answer("Введи дату (DD.MM или YYYY-MM-DD). Например: 03.02 или 2026-02-03.", reply_markup=main_menu_kb())
-                    return
-                else:
-                    # try parse date directly from free text
-                    s0 = t_norm
-                    start_date = None
-                    m1 = re.search(r"(\d{4})-(\d{2})-(\d{2})", s0)
-                    if m1:
-                        try:
-                            start_date = dt.date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
-                        except Exception:
-                            start_date = None
-                    if start_date is None:
-                        m2 = re.search(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?", s0)
-                        if m2:
-                            try:
-                                dd = int(m2.group(1))
-                                mm = int(m2.group(2))
-                                yy = int(m2.group(3)) if m2.group(3) else today_local.year
-                                start_date = dt.date(yy, mm, dd)
-                            except Exception:
-                                start_date = None
-                    if start_date is None:
-                        await message.answer("Выбери день кнопкой 👇 (или напиши: «завтра», «послезавтра», «03.02»).", reply_markup=plan_when_kb())
-                        return
-                    if start_date < today_local:
-                        await message.answer(f"Эта дата в прошлом ({start_date.isoformat()}). Выбери сегодня/будущую.", reply_markup=plan_when_kb())
-                        return
-
-                data2: dict[str, Any] = {"start_date": start_date.isoformat()}
-                if isinstance(prev_data, dict) and isinstance(prev_data.get("days_prefill"), int):
-                    data2["days_prefill"] = prev_data.get("days_prefill")
-                await user_repo.set_dialog(user, state="plan_store", step=0, data=data2)
-                await db.commit()
-                await message.answer(f"🛒 Ок. Старт: <b>{start_date.isoformat()}</b>.\nГде покупаем?", reply_markup=plan_store_kb())
-                return
-
-            if user.dialog_state == "plan_date":
-                try:
-                    prev_data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-                except Exception:
-                    prev_data = {}
-                s0 = _norm_text(t)
-                start_date: dt.date | None = None
-                # YYYY-MM-DD
-                m1 = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s0)
-                if m1:
-                    try:
-                        start_date = dt.date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
-                    except Exception:
-                        start_date = None
-                # DD.MM or DD.MM.YYYY
-                if start_date is None:
-                    m2 = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?$", s0)
-                    if m2:
-                        try:
-                            dd = int(m2.group(1))
-                            mm = int(m2.group(2))
-                            yy = int(m2.group(3)) if m2.group(3) else today_local.year
-                            start_date = dt.date(yy, mm, dd)
-                        except Exception:
-                            start_date = None
-
-                if start_date is None:
-                    await message.answer("Не понял дату. Пример: 03.02 или 2026-02-03.", reply_markup=main_menu_kb())
-                    return
-                if start_date < today_local:
-                    await message.answer(f"Эта дата в прошлом ({start_date.isoformat()}). Введи будущую/сегодня.", reply_markup=main_menu_kb())
-                    return
-
-                data2: dict[str, Any] = {"start_date": start_date.isoformat()}
-                if isinstance(prev_data, dict) and isinstance(prev_data.get("days_prefill"), int):
-                    data2["days_prefill"] = prev_data.get("days_prefill")
-                await user_repo.set_dialog(user, state="plan_store", step=0, data=data2)
-                await db.commit()
-                await message.answer(f"🛒 Ок. Старт: <b>{start_date.isoformat()}</b>.\nГде покупаем?", reply_markup=plan_store_kb())
-                return
-
-            if user.dialog_state == "plan_store":
-                # normalize store choice
-                store_choice = None
-                if t == BTN_STORE_ANY:
-                    store_choice = "any"
-                elif t == BTN_STORE_KAUFLAND:
-                    store_choice = "Kaufland"
-                elif t == BTN_STORE_LIDL:
-                    store_choice = "Lidl"
-                elif t == BTN_STORE_ALBERT:
-                    store_choice = "Albert"
-                elif t == BTN_STORE_PENNY:
-                    store_choice = "PENNY"
-                else:
-                    await message.answer("Выбери магазин кнопкой 👇", reply_markup=plan_store_kb())
-                    return
-
-                start_date = today_local
-                days_prefill: int | None = None
+            n = _parse_int(t)
+            if n is None:
                 try:
                     data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-                    sd = (data or {}).get("start_date")
-                    if isinstance(sd, str):
-                        start_date = dt.date.fromisoformat(sd)
                     dp = (data or {}).get("days_prefill")
                     if isinstance(dp, int) and 1 <= dp <= 7:
-                        days_prefill = dp
+                        n = dp
                 except Exception:
-                    pass
-
-                data2: dict[str, Any] = {"start_date": start_date.isoformat(), "store_only": store_choice}
-                if days_prefill is not None:
-                    data2["days_prefill"] = days_prefill
-                await user_repo.set_dialog(user, state="plan_days", step=0, data=data2)
-                await db.commit()
-                await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b> | 🛒 Магазин: <b>{store_choice}</b>\nНа сколько дней? (1-7)", reply_markup=plan_days_kb())
+                    n = None
+            if n is None:
+                # accept common buttons
+                if t == BTN_DAYS_1:
+                    n = 1
+                elif t == BTN_DAYS_3:
+                    n = 3
+                elif t == BTN_DAYS_7:
+                    n = 7
+            if n is None or n not in {1, 3, 7}:
+                await message.answer("Выбери 1 / 3 / 7 дней кнопкой 👇", reply_markup=plan_days_kb())
                 return
 
-            if user.dialog_state == "plan_days":
-                n = _parse_int(t)
-                if n is None:
-                    try:
-                        data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-                        dp = (data or {}).get("days_prefill")
-                        if isinstance(dp, int) and 1 <= dp <= 7:
-                            n = dp
-                    except Exception:
-                        n = None
-                if n is None or not (1 <= n <= 7):
-                    await message.answer("Напиши число от 1 до 7 (или выбери кнопку).", reply_markup=plan_days_kb())
-                    return
-                # pull start_date from dialog data (default: today_local)
-                start_date = today_local
-                store_only: str | None = None
-                try:
-                    data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-                    sd = (data or {}).get("start_date")
-                    if isinstance(sd, str):
-                        start_date = dt.date.fromisoformat(sd)
-                    so = (data or {}).get("store_only")
-                    if isinstance(so, str) and so.strip():
-                        store_only = so.strip()
-                except Exception:
-                    pass
-
-                # mark as generating to prevent "Аууу" / random text from being routed elsewhere
-                await user_repo.set_dialog(
-                    user,
-                    state="plan_generating",
-                    step=0,
-                    data={"start_date": start_date.isoformat(), "days": n, "store_only": store_only or "any", "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
-                )
-                await db.commit()
-                await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=cancel_kb())
-                await _generate_plan_for_days(message, db=db, user=user, days=n, start_date=start_date, store_only=store_only)
-                return
-
-        # plan_edit dialog (iterative tweaks)
-        if user.dialog_state == "plan_edit":
-            t0 = (message.text or "").strip()
-            if t0 in {BTN_PLAN_EDIT_CANCEL, BTN_MENU, BTN_CANCEL, "❌ Отмена"}:
-                await user_repo.set_dialog(user, state=None, step=None, data=None)
-                await db.commit()
-                await message.answer("Ок, закрыл правки. 🧠 Если нужно — снова жми 🗓️ Рацион на день.", reply_markup=main_menu_kb())
-                return
-
-            data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+            start_date = today_local + dt.timedelta(days=1)
             try:
-                start_date = dt.date.fromisoformat(str((data or {}).get("start_date")))
+                data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+                sd = (data or {}).get("start_date")
+                if isinstance(sd, str):
+                    start_date = dt.date.fromisoformat(sd)
             except Exception:
-                pref_repo = PreferenceRepo(db)
-                prefs = await pref_repo.get_json(user.id)
-                tz = _tz_from_prefs(prefs)
-                start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
-            days = int((data or {}).get("days") or 1)
-            store_only = str((data or {}).get("store_only") or "any").strip()
-            if store_only.lower() == "any":
-                store_only = "any"
+                pass
 
-            if t0 == BTN_PLAN_REGEN:
-                await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date, store_only=store_only)
-                return
-
-            if t0 == BTN_PLAN_APPROVE:
-                plan_repo = PlanRepo(db)
-                for i in range(days):
-                    d = start_date + dt.timedelta(days=i)
-                    p = await plan_repo.get_day_plan_json(user.id, d)
-                    if isinstance(p, dict):
-                        p["_meta"] = {"approved": True, "approved_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()}
-                        await plan_repo.upsert_day_plan(user_id=user.id, date=d, calories_target=None, plan=p)
-                await db.commit()
-                await user_repo.set_dialog(user, state=None, step=None, data=None)
-                await db.commit()
-                await message.answer("✅ Утвердил! План зафиксирован 💪📌\n\nЗавтра можно так же: подкорректируем и утвердим.", reply_markup=main_menu_kb())
-                return
-
-            # Apply memory (so future plans follow new constraints)
-            pref_repo = PreferenceRepo(db)
-            await _apply_coach_memory_if_needed(message, pref_repo=pref_repo, user=user)
-            prefs = await pref_repo.get_json(user.id)
-
-            # Edit day 1 by default; allow "день 2" etc
-            day_idx = 1
-            mday = re.search(r"(?:день|day)\s*(\d+)", _norm_text(t0))
-            if mday:
-                try:
-                    day_idx = max(1, min(int(mday.group(1)), days))
-                except Exception:
-                    day_idx = 1
-            edit_date = start_date + dt.timedelta(days=day_idx - 1)
-
-            plan_repo = PlanRepo(db)
-            current = await plan_repo.get_day_plan_json(user.id, edit_date) or {}
-            active = _active_targets(prefs=prefs, user=user, date_local=edit_date)
-            kcal_target = int(active.get("kcal") or user.calories_target or 0)
-            if kcal_target <= 0:
-                await message.answer("Не вижу целевую норму калорий. Открой 👤 Профиль и зафиксируй цели.", reply_markup=main_menu_kb())
-                return
-
-            store_line = "" if store_only.lower() == "any" else f"Покупка только в магазине: {store_only}."
-
-            # Ask model to patch the plan
-            last_plan: dict[str, Any] | None = None
-            last_err: Exception | None = None
-            edit_prompt = (
-                _profile_context(user)
-                + "\nПредпочтения/режим дня (из БД):\n"
-                + dumps(prefs)
-                + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
-                + store_line
-                + f"\nТекущий план на {edit_date.isoformat()}:\n"
-                + dumps(current)
-                + "\n\nПросьба пользователя:\n"
-                + t0
-                + "\nВАЖНО: минимальные изменения, пересчитать граммы/ккал под цель, без спорт-добавок.\n"
+            await user_repo.set_dialog(
+                user,
+                state="plan_generating",
+                step=0,
+                data={"start_date": start_date.isoformat(), "days": int(n), "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
             )
-            models_to_try: list[str] = []
-            m_fast = str(getattr(settings, "openai_plan_model_fast", "") or "").strip()
-            if m_fast:
-                models_to_try.append(m_fast)
-            models_to_try.append(settings.openai_plan_model)
-            m_fb = str(getattr(settings, "openai_plan_model_fallback", "") or "").strip()
-            if m_fb:
-                models_to_try.append(m_fb)
-            models_seen: set[str] = set()
-            for m in models_to_try:
-                if not m or m in models_seen:
-                    continue
-                models_seen.add(m)
-                try:
-                    patched_raw = await text_json(
-                        system=f"{SYSTEM_COACH}\n\n{PLAN_EDIT_JSON}",
-                        user=edit_prompt,
-                        model=m,
-                        max_output_tokens=1400,
-                        timeout_s=getattr(settings, "openai_plan_timeout_s", 30),
-                    )
-                except Exception as e:
-                    last_err = e
-                    continue
-                if not isinstance(patched_raw, dict):
-                    last_err = RuntimeError("Patched plan JSON is not an object")
-                    continue
-                patched = _normalize_day_plan(patched_raw, store_only=store_only)
-                last_plan = patched
-                if _plan_quality_ok(patched, kcal_target):
-                        break
-            if last_plan is None or not _plan_quality_ok(last_plan, kcal_target):
-                err = last_err or RuntimeError(f"Plan edit quality not OK for target {kcal_target}")
-                err_snip = _scrub_secrets(str(err)).strip()
-                err_snip = _escape_html(err_snip[:180]) if err_snip else ""
-                await message.answer(
-                    "⚠️ Не смог качественно внести правку (чтобы сохранить цель КБЖУ).\n\n"
-                    "Варианты:\n"
-                    "- Нажми <b>🔁 Пересобрать рацион</b>\n"
-                    "- Или напиши по‑другому/попроще (пример: «замени перекус 09:00 на вариант за рулём, без молочки»)\n"
-                    + (f"\nТех.деталь: <code>{type(err).__name__}</code>\n<code>{err_snip}</code>" if err_snip else f"\nТех.деталь: <code>{type(err).__name__}</code>"),
-                    reply_markup=plan_edit_kb(),
-                )
-                return
-            new_plan = last_plan
-            await plan_repo.upsert_day_plan(user_id=user.id, date=edit_date, calories_target=kcal_target, plan=new_plan)
             await db.commit()
-
-            # Reload all days and show updated plan + shopping list
-            day_plans = await _load_day_plans(plan_repo=plan_repo, user_id=user.id, start_date=start_date, days=days)
-            await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans, store_only=store_only)
-            await message.answer("🛠️ Ок! Поменял. Хочешь ещё правки? Пиши текстом или жми ✅ Утвердить.", reply_markup=plan_edit_kb())
+            await message.answer("⏳ Готовлю рацион… (обычно 10–60 сек) 🍽️", reply_markup=cancel_kb())
+            await _generate_plan_for_days(message, db=db, user=user, days=int(n), start_date=start_date)
             return
 
         # Agent router (free-form commands)
@@ -3987,16 +3555,20 @@ async def any_text(message: Message) -> None:
             )
             return
         if action == "plan_day":
-            # Start interactive flow (date/store/days) for better UX
             async with SessionLocal() as db:
                 user_repo = UserRepo(db)
+                pref_repo = PreferenceRepo(db)
                 user = await user_repo.get_or_create(message.from_user.id, message.from_user.username if message.from_user else None)
                 if not user.profile_complete:
                     await message.answer("Сначала заполним профиль: /start")
                     return
-                await user_repo.set_dialog(user, state="plan_when", step=0, data=None)
+                prefs = await pref_repo.get_json(user.id)
+                tz = _tz_from_prefs(prefs)
+                today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+                start_date = today_local + dt.timedelta(days=1)
+                await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat()})
                 await db.commit()
-            await message.answer("📅 На какой день сделать рацион? 👇", reply_markup=plan_when_kb())
+            await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b>\nНа сколько дней? (1/3/7)", reply_markup=plan_days_kb())
             return
         if action == "analyze_week":
             await cmd_week(message)
