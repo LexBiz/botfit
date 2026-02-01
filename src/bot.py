@@ -70,6 +70,7 @@ from src.keyboards import (
     plan_edit_kb,
     plan_store_kb,
     plan_when_kb,
+    cancel_kb,
     BTN_STORE_ALBERT,
     BTN_STORE_ANY,
     BTN_STORE_KAUFLAND,
@@ -2596,9 +2597,14 @@ async def cmd_plan(message: Message) -> None:
         prefs = await pref_repo.get_json(user.id)
         tz = _tz_from_prefs(prefs)
         start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
-        await user_repo.set_dialog(user, state="plan_generating", step=0, data={"start_date": start_date.isoformat(), "days": days})
+        await user_repo.set_dialog(
+            user,
+            state="plan_generating",
+            step=0,
+            data={"start_date": start_date.isoformat(), "days": days, "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
+        )
         await db.commit()
-        await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=main_menu_kb())
+        await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=cancel_kb())
         await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date)
         return
 
@@ -2911,12 +2917,26 @@ async def any_text(message: Message) -> None:
         # If a long-running plan is being generated, keep UX tight.
         t_now = (message.text or "").strip()
         if user.dialog_state == "plan_generating":
-            if t_now in {BTN_CANCEL, "❌ Отмена", BTN_MENU}:
+            # auto-timeout: if stuck too long, reset
+            try:
+                data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+                started = data.get("started_at_utc") if isinstance(data, dict) else None
+                if isinstance(started, str):
+                    st = dt.datetime.fromisoformat(started.replace("Z", "+00:00"))
+                    if (dt.datetime.now(dt.timezone.utc) - st) > dt.timedelta(seconds=90):
+                        await user_repo.set_dialog(user, state=None, step=None, data=None)
+                        await db.commit()
+                        await message.answer("⚠️ Похоже, генерация зависла. Сбросил режим.\n\nЖми 🗓️ Рацион на день ещё раз.", reply_markup=main_menu_kb())
+                        return
+            except Exception:
+                pass
+
+            if _norm_text(t_now) in {_norm_text(BTN_CANCEL), "отмена"} or t_now in {"❌ Отмена", BTN_MENU}:
                 await user_repo.set_dialog(user, state=None, step=None, data=None)
                 await db.commit()
                 await message.answer("Ок, отменил. 🧠 Если нужно — снова жми 🗓️ Рацион на день.", reply_markup=main_menu_kb())
                 return
-            await message.answer("⏳ Я собираю рацион прямо сейчас…\n\nПодожди 10–40 сек или нажми ❌ Отмена.", reply_markup=main_menu_kb())
+            await message.answer("⏳ Я собираю рацион прямо сейчас…\n\nПодожди 10–40 сек или нажми ❌ Отмена.", reply_markup=cancel_kb())
             return
 
         handled = await _handle_targets_mode(message, user_repo=user_repo, user=user, db=db)
@@ -3312,9 +3332,14 @@ async def any_text(message: Message) -> None:
                     pass
 
                 # mark as generating to prevent "Аууу" / random text from being routed elsewhere
-                await user_repo.set_dialog(user, state="plan_generating", step=0, data={"start_date": start_date.isoformat(), "days": n})
+                await user_repo.set_dialog(
+                    user,
+                    state="plan_generating",
+                    step=0,
+                    data={"start_date": start_date.isoformat(), "days": n, "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
+                )
                 await db.commit()
-                await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=main_menu_kb())
+                await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=cancel_kb())
                 await _generate_plan_for_days(message, db=db, user=user, days=n, start_date=start_date)
                 return
 

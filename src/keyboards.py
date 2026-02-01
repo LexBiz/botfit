@@ -152,3 +152,15 @@ def plan_edit_kb() -> ReplyKeyboardMarkup:
         input_field_placeholder="Напиши, что поменять в рационе",
     )
 
+
+def cancel_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_CANCEL],
+        [BTN_MENU],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        input_field_placeholder="Можно отменить",
+    )
+
