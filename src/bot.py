@@ -2684,15 +2684,21 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                     break
             plan = last_plan or {}
             day_plans.append(plan)
-    except Exception:
-        # Safe fallback: return plain text plan instead of failing.
-        plan_text = await text_output(
-            system=SYSTEM_NUTRITIONIST
-            + "\nСоставь рацион на день для Чехии (Lidl/Kaufland/Albert) с граммовками, рецептами и КБЖУ. Пиши структурировано.",
-            user=_profile_context(user) + f"\nНорма: {user.calories_target} ккал. Составь рацион на день.",
-            max_output_tokens=1400,
+    except Exception as e:
+        # Do NOT send low-quality plain-text plans (they break store constraints and product clarity).
+        # Instead, keep user in "plan_edit" mode with a clear retry action.
+        try:
+            user_repo = UserRepo(db)
+            await user_repo.set_dialog(user, state="plan_edit", step=0, data={"start_date": start_date.isoformat(), "days": days})
+            await db.commit()
+        except Exception:
+            pass
+        await message.answer(
+            "⚠️ Не смог собрать качественный рацион (ошибка генерации).\n\n"
+            "Жми <b>🔁 Пересобрать рацион</b> — я сделаю новый вариант строго под выбранный магазин и твой КБЖУ.\n"
+            f"Тех.деталь: <code>{type(e).__name__}</code>",
+            reply_markup=plan_edit_kb(),
         )
-        await message.answer(_sanitize_ai_text(plan_text)[:3900], reply_markup=main_menu_kb())
         return
 
     # persist plans
