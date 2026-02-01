@@ -1691,6 +1691,25 @@ async def _apply_coach_memory_if_needed(message: Message, *, pref_repo: Preferen
             if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip()) and d in {"weekdays", "weekends", "all"} and isinstance(txt, str) and txt.strip():
                 rems.append({"time": t.strip(), "days": d, "text": txt.strip()})
         merged_patch["reminders"] = rems
+    # targets override (store in prefs + user snapshot)
+    if isinstance(patch.get("targets"), dict):
+        t = patch.get("targets") or {}
+        targ: dict[str, Any] = {}
+        for k in ["calories", "calories_weekdays", "calories_weekends", "protein_g", "fat_g", "carbs_g"]:
+            v = t.get(k)
+            if isinstance(v, (int, float)):
+                targ[k] = int(round(float(v)))
+        if targ:
+            merged_patch["targets"] = targ
+            # apply to user snapshot (single-day defaults)
+            if "calories" in targ:
+                user.calories_target = int(targ["calories"])
+            if "protein_g" in targ:
+                user.protein_g_target = int(targ["protein_g"])
+            if "fat_g" in targ:
+                user.fat_g_target = int(targ["fat_g"])
+            if "carbs_g" in targ:
+                user.carbs_g_target = int(targ["carbs_g"])
     if isinstance(patch.get("notes"), str) and patch.get("notes"):
         merged_patch["notes"] = str(patch["notes"]).strip()
 
@@ -2194,25 +2213,85 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
     pref_repo = PreferenceRepo(db)
     prefs = await pref_repo.get_json(user.id)
     start_date = dt.date.today()
+    # choose target kcal/macros: prefer explicit targets from prefs (incl weekday/weekend)
+    targ = prefs.get("targets") if isinstance(prefs.get("targets"), dict) else {}
+    def _get_day_kcal(d: dt.date) -> int | None:
+        if isinstance(targ, dict):
+            wd = d.weekday()
+            is_weekday = wd < 5
+            if is_weekday and isinstance(targ.get("calories_weekdays"), (int, float)):
+                return int(targ.get("calories_weekdays"))
+            if (not is_weekday) and isinstance(targ.get("calories_weekends"), (int, float)):
+                return int(targ.get("calories_weekends"))
+            if isinstance(targ.get("calories"), (int, float)):
+                return int(targ.get("calories"))
+        return int(user.calories_target) if user.calories_target is not None else None
+
+    target_macros = {
+        "protein_g": int(targ.get("protein_g")) if isinstance(targ, dict) and isinstance(targ.get("protein_g"), (int, float)) else user.protein_g_target,
+        "fat_g": int(targ.get("fat_g")) if isinstance(targ, dict) and isinstance(targ.get("fat_g"), (int, float)) else user.fat_g_target,
+        "carbs_g": int(targ.get("carbs_g")) if isinstance(targ, dict) and isinstance(targ.get("carbs_g"), (int, float)) else user.carbs_g_target,
+    }
+
+    def _plan_quality_ok(plan: dict[str, Any], kcal_target: int) -> bool:
+        try:
+            meals = plan.get("meals") or []
+            if not isinstance(meals, list) or not meals:
+                return False
+            for m in meals:
+                prods = (m or {}).get("products") or []
+                if not isinstance(prods, list) or not prods:
+                    return False
+                for p in prods:
+                    if not p or not p.get("name") or float(p.get("grams") or 0) <= 0:
+                        return False
+            totals = plan.get("totals") or {}
+            kcal = totals.get("kcal")
+            if kcal is None:
+                kcal = sum(float((m or {}).get("kcal") or 0) for m in meals)
+            kcal = float(kcal)
+            # within 7%
+            return abs(kcal - float(kcal_target)) <= float(kcal_target) * 0.07
+        except Exception:
+            return False
+
     try:
         day_plans: list[dict[str, Any]] = []
         for i in range(days):
             d = start_date + dt.timedelta(days=i)
-            plan = await text_json(
-                system=f"{SYSTEM_NUTRITIONIST}\n\n{DAY_PLAN_JSON}",
-                user=(
-                    _profile_context(user)
-                    + "\nПредпочтения/режим дня (из БД):\n"
-                    + dumps(prefs)
-                    + f"\nСоставь рацион на {d.isoformat()} на {user.calories_target} ккал.\n"
-                    + "Требования:\n"
-                    + "- Сделай разнообразно (не повторяй одинаковые блюда изо дня в день).\n"
-                    + "- Если есть meal_times — привяжи приёмы пищи к этим временам.\n"
-                    + "- Учитывай ограничения/аллергии/нелюбимое.\n"
-                    + "- shopping_list обязательно заполни.\n"
-                ),
-                max_output_tokens=1400,
+            kcal_target = _get_day_kcal(d)
+            if kcal_target is None:
+                raise RuntimeError("Нет целевой нормы калорий в профиле.")
+            macro_line = (
+                f"Целевые БЖУ: Б {target_macros.get('protein_g')} / Ж {target_macros.get('fat_g')} / У {target_macros.get('carbs_g')} г.\n"
+                if any(target_macros.values())
+                else ""
             )
+            # retry once if model doesn't match targets or misses products/shopping list
+            last_plan: dict[str, Any] | None = None
+            for attempt in range(2):
+                extra = "" if attempt == 0 else "\nВАЖНО: прошлый вариант не соответствовал целевым ккал/или не заполнил продукты/граммы. Исправь."
+                plan = await text_json(
+                    system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
+                    user=(
+                        _profile_context(user)
+                        + "\nПредпочтения/режим дня (из БД):\n"
+                        + dumps(prefs)
+                        + f"\nСоставь рацион на {d.isoformat()} на <b>{kcal_target} ккал</b>.\n"
+                        + macro_line
+                        + "Требования:\n"
+                        + "- Сумма за день должна попасть в цель (допуск ±5%).\n"
+                        + "- Продукты реальные и типовые для Чехии (Lidl/Kaufland/Albert).\n"
+                        + "- В каждом приёме пищи обязателен список продуктов с граммами.\n"
+                        + "- shopping_list обязателен.\n"
+                        + extra
+                    ),
+                    max_output_tokens=1500,
+                )
+                last_plan = plan
+                if isinstance(plan, dict) and _plan_quality_ok(plan, kcal_target):
+                    break
+            plan = last_plan or {}
             day_plans.append(plan)
     except Exception:
         # Safe fallback: return plain text plan instead of failing.
@@ -2227,10 +2306,12 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
 
     # persist plans
     for i, plan in enumerate(day_plans):
+        d = start_date + dt.timedelta(days=i)
+        kcal_target = _get_day_kcal(d) or user.calories_target
         await plan_repo.upsert_day_plan(
             user_id=user.id,
             date=start_date + dt.timedelta(days=i),
-            calories_target=user.calories_target,
+            calories_target=int(kcal_target) if kcal_target is not None else None,
             plan=plan,
         )
     await db.commit()
