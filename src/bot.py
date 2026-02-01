@@ -47,6 +47,7 @@ from src.food_service import FoodService, compute_item_macros
 from src.food_service import make_store_search_url
 from src.keyboards import (
     BTN_CANCEL,
+    BTN_COACH,
     BTN_DAYS_1,
     BTN_DAYS_3,
     BTN_DAYS_7,
@@ -740,6 +741,7 @@ async def cmd_help(message: Message) -> None:
         "- /profile — профиль и текущая норма\n"
         "- /weight 82.5 — обновить вес и пересчитать\n"
         "- /plan — рацион на день (Чехия: Lidl/Kaufland/Albert)\n"
+        "- 🧠 AI Тренер — режим ведения (вопросы/дисциплина/график)\n"
         "- /week — анализ дневника за 7 дней\n"
         "- /recipe — расчет рецепта по ингредиентам (КБЖУ)\n"
         "- /reset — сброс профиля"
@@ -2897,6 +2899,10 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             if m_fast:
                 models_to_try.append(m_fast)
             models_to_try.append(settings.openai_plan_model)
+            # Optional extra fallback (helps when some models return empty content/refusal)
+            m_fb = str(getattr(settings, "openai_plan_model_fallback", "") or "").strip()
+            if m_fb:
+                models_to_try.append(m_fb)
             models_seen: set[str] = set()
             for m in models_to_try:
                 if not m or m in models_seen:
@@ -3262,6 +3268,20 @@ async def any_text(message: Message) -> None:
         if t in {BTN_PROFILE}:
             await cmd_profile(message)
             return
+        if t in {BTN_COACH}:
+            # short intake -> then coach builds plan/discipline/schedule
+            await user_repo.set_dialog(user, state="coach_intake", step=0, data=None)
+            await db.commit()
+            await message.answer(
+                "🧠 <b>AI Тренер</b>\n\n"
+                "⚡️ 3 пункта, чтобы я вёл тебя чётко:\n"
+                "🍚 <b>Тренировочный день</b>: угли не режем ниже плана — иначе сила/прогресс просядут.\n"
+                "😴 <b>Сон/режим</b>: отбой 21:30 — держим, это критично (особенно на hard‑режиме).\n"
+                "📌 <b>Дальше</b>: отвечай на 2 вопроса — и я соберу план по рациону/дисциплине/графику.\n\n"
+                "❓ <b>1/2</b> Во сколько завтра тренировка и какая: силовая/кардио/смешанная?",
+                reply_markup=cancel_kb(),
+            )
+            return
         if t in {BTN_PLAN}:
             await user_repo.set_dialog(user, state="plan_when", step=0, data=None)
             await db.commit()
@@ -3322,6 +3342,129 @@ async def any_text(message: Message) -> None:
             await db.commit()
             if not handled:
                 await message.answer("Не понял напоминания. Напиши проще (время + что спрашивать).", reply_markup=main_menu_kb())
+            return
+
+        # AI coach intake dialog (2 questions)
+        if user.dialog_state == "coach_intake":
+            t0 = (message.text or "").strip()
+            if t0 in {"❌ Отмена", BTN_CANCEL, BTN_MENU}:
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await message.answer("Ок, вышел из AI‑тренера. Если нужно — снова жми 🧠 AI Тренер.", reply_markup=main_menu_kb())
+                return
+
+            step = int(user.dialog_step or 0)
+            data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+            data = data if isinstance(data, dict) else {}
+
+            if step <= 0:
+                data["tomorrow_training"] = t0
+                await user_repo.set_dialog(user, state="coach_intake", step=1, data=data)
+                await db.commit()
+                await message.answer(
+                    "❓ <b>2/2</b> Завтра ты хочешь 3 приёма (05:30/09:00/11:00) + перекусы,\n"
+                    "или будет ещё ужин после работы? (и во сколько примерно)",
+                    reply_markup=cancel_kb(),
+                )
+                return
+
+            # step 1 -> finalize and answer
+            data["tomorrow_meals"] = t0
+            await user_repo.set_dialog(user, state=None, step=None, data=None)
+            await db.commit()
+
+            # persist as preference note so coach can reference it later
+            try:
+                pref_repo = PreferenceRepo(db)
+                await pref_repo.merge(
+                    user.id,
+                    {
+                        "coach_intake": {
+                            "tomorrow_training": str(data.get("tomorrow_training") or "").strip(),
+                            "tomorrow_meals": str(data.get("tomorrow_meals") or "").strip(),
+                            "captured_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        }
+                    },
+                )
+                await db.commit()
+            except Exception:
+                pass
+
+            q = (
+                "Собери мне план на завтра: рацион (под мои цели), дисциплина/режим и график.\n"
+                f"Тренировка: {data.get('tomorrow_training')}\n"
+                f"Питание/время: {data.get('tomorrow_meals')}\n"
+                "Если нужно — предложи 1-2 уточнения. Потом дай чёткий план по пунктам."
+            )
+
+            pref_repo = PreferenceRepo(db)
+            plan_repo = PlanRepo(db)
+            note_repo = CoachNoteRepo(db)
+            prefs = await pref_repo.get_json(user.id)
+            today_plan = await plan_repo.get_day_plan_json(user.id, dt.date.today())
+            recent_notes = await note_repo.last_notes(user.id, limit=20)
+            last_meals = await meal_repo.last_meals(user.id, limit=12)
+            meals_json = [
+                {
+                    "created_at": m.created_at.isoformat(),
+                    "source": m.source,
+                    "calories": m.calories,
+                    "protein_g": m.protein_g,
+                    "fat_g": m.fat_g,
+                    "carbs_g": m.carbs_g,
+                    "description_raw": m.description_raw,
+                }
+                for m in last_meals
+            ]
+            try:
+                deficit_pct = prefs.get("deficit_pct")
+                _, meta = compute_targets_with_meta(
+                    sex=user.sex,  # type: ignore[arg-type]
+                    age=user.age,
+                    height_cm=user.height_cm,
+                    weight_kg=user.weight_kg,
+                    activity=user.activity_level,  # type: ignore[arg-type]
+                    goal=user.goal,  # type: ignore[arg-type]
+                    deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
+                )
+                calc_meta = {"bmr_kcal": meta.bmr_kcal, "tdee_kcal": meta.tdee_kcal, "deficit_pct": meta.deficit_pct, "deficit_kcal": meta.deficit_kcal}
+            except Exception:
+                calc_meta = None
+
+            ctx = {
+                "profile": {
+                    "age": user.age,
+                    "sex": user.sex,
+                    "height_cm": user.height_cm,
+                    "weight_kg": user.weight_kg,
+                    "activity_level": user.activity_level,
+                    "goal": user.goal,
+                    "calories_target": user.calories_target,
+                    "macros_target": [user.protein_g_target, user.fat_g_target, user.carbs_g_target],
+                },
+                "calc_meta": calc_meta,
+                "preferences": prefs,
+                "today_plan": today_plan,
+                "recent_meals": meals_json,
+                "coach_notes": recent_notes,
+            }
+
+            try:
+                ans = await text_output(
+                    system=f"{SYSTEM_COACH}\n\n{COACH_CHAT_GUIDE}",
+                    user="Контекст (из БД):\n" + dumps(ctx) + "\n\nЗапрос пользователя:\n" + q,
+                    max_output_tokens=900,
+                )
+                out = _safe_nonempty_text(_sanitize_ai_text(ans), fallback="⚠️ Похоже, ответ получился пустым. Попробуй ещё раз.")
+                await _safe_answer_html(message, out, reply_markup=main_menu_kb())
+            except Exception as e:
+                err_snip = _scrub_secrets(str(e)).strip()
+                err_snip = _escape_html(err_snip[:180]) if err_snip else ""
+                await message.answer(
+                    "⚠️ Сейчас не могу собрать план тренера (ошибка AI).\n"
+                    f"Тех.деталь: <code>{type(e).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
+                    reply_markup=main_menu_kb(),
+                )
             return
 
         # progress mode dialog (text only; photos handled in photo handler)
@@ -3702,6 +3845,9 @@ async def any_text(message: Message) -> None:
             if m_fast:
                 models_to_try.append(m_fast)
             models_to_try.append(settings.openai_plan_model)
+            m_fb = str(getattr(settings, "openai_plan_model_fallback", "") or "").strip()
+            if m_fb:
+                models_to_try.append(m_fb)
             models_seen: set[str] = set()
             for m in models_to_try:
                 if not m or m in models_seen:

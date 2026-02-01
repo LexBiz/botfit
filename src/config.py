@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     openai_plan_model: str = Field(default="gpt-5.2", validation_alias="OPENAI_PLAN_MODEL")
     # Fast/cheap primary model for plans; fallback to openai_plan_model if quality/JSON fails
     openai_plan_model_fast: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_PLAN_MODEL_FAST")
+    # Extra fallback model for plans (useful when some models return empty content)
+    openai_plan_model_fallback: str = Field(default="gpt-4o", validation_alias="OPENAI_PLAN_MODEL_FALLBACK")
     # Plan-specific timeout (seconds). Keep lower than global to avoid 2-3 minute waits.
     openai_plan_timeout_s: int = Field(default=30, validation_alias="OPENAI_PLAN_TIMEOUT_S")
     # Hard timeout for OpenAI requests (seconds) to avoid "hangs"

@@ -75,6 +75,29 @@ async def _chat_create(
 
     timeout_s = int(timeout_s if timeout_s is not None else getattr(settings, "openai_timeout_s", 45))
 
+    def _extract_text_or_raise(cc: Any) -> str:
+        """
+        Chat Completions can return empty content (e.g. refusal/content_filter).
+        Make this explicit so callers don't see mysterious '<empty>' JSON failures.
+        """
+        try:
+            choice0 = cc.choices[0]
+            msg = getattr(choice0, "message", None)
+            content = getattr(msg, "content", None) if msg is not None else None
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            refusal = getattr(msg, "refusal", None) if msg is not None else None
+            if isinstance(refusal, str) and refusal.strip():
+                raise RuntimeError(f"Chat completion refused: {refusal.strip()[:300]}")
+            finish = getattr(choice0, "finish_reason", None)
+            if finish:
+                raise RuntimeError(f"Chat completion returned empty content (finish_reason={finish})")
+        except Exception as e:
+            # if extraction fails for unexpected shapes, surface the error
+            raise RuntimeError(f"Chat completion returned unusable message: {_fmt_exc(e)}")
+        # no content + no refusal + no finish_reason -> still treat as error
+        raise RuntimeError("Chat completion returned empty content")
+
     # 1) Try max_completion_tokens with/without response_format
     try:
         kwargs: dict[str, Any] = {"max_completion_tokens": max_output_tokens}
@@ -84,7 +107,7 @@ async def _chat_create(
             client.chat.completions.create(model=model, messages=messages, **kwargs),
             timeout=timeout_s,
         )
-        return (cc.choices[0].message.content or "").strip()
+        return _extract_text_or_raise(cc)
     except Exception as e:
         last_err = e
         if response_format is not None and _is_unsupported_param_error(e, "response_format"):
@@ -97,7 +120,7 @@ async def _chat_create(
                     ),
                     timeout=timeout_s,
                 )
-                return (cc.choices[0].message.content or "").strip()
+                return _extract_text_or_raise(cc)
             except Exception as e2:
                 last_err = e2
         # If max_completion_tokens is supported, do NOT fall back to max_tokens.
@@ -113,7 +136,7 @@ async def _chat_create(
             client.chat.completions.create(model=model, messages=messages, **kwargs2),
             timeout=timeout_s,
         )
-        return (cc.choices[0].message.content or "").strip()
+        return _extract_text_or_raise(cc)
     except Exception as e:
         last_err = e
         if response_format is not None and _is_unsupported_param_error(e, "response_format"):
@@ -125,7 +148,7 @@ async def _chat_create(
                 ),
                 timeout=timeout_s,
             )
-            return (cc.choices[0].message.content or "").strip()
+            return _extract_text_or_raise(cc)
         raise RuntimeError(f"Chat completion failed. Last error: {_fmt_exc(last_err)}")
 
 
