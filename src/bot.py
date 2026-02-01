@@ -142,6 +142,10 @@ def _sanitize_ai_text(s: str) -> str:
     return t
 
 
+def _has_cyrillic_text(s: str) -> bool:
+    return any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in (s or ""))
+
+
 def _active_targets(
     *,
     prefs: dict[str, Any],
@@ -2622,6 +2626,11 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         img_url = assets.get("img_url")
         off_url = assets.get("off_url")
         store_url = assets.get("store_url") or make_store_search_url(store, display_name)
+        # If display_name is Cyrillic and we have a better non-cyrillic search_query, prefer it for store URL
+        if _has_cyrillic_text(display_name):
+            sq = assets.get("search_query")
+            if isinstance(sq, str) and sq:
+                store_url = make_store_search_url(store, sq)
         buy_hint = _suggest_buy(display_name, grams)
         links: list[str] = []
         if isinstance(img_url, str) and img_url:
@@ -3092,11 +3101,13 @@ async def any_text(message: Message) -> None:
             today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
 
             if user.dialog_state == "plan_when":
-                if t == BTN_PLAN_TODAY:
+                t_norm = _norm_text(t)
+                # accept free-form text too
+                if t == BTN_PLAN_TODAY or "сегодня" in t_norm:
                     start_date = today_local
-                elif t == BTN_PLAN_TOMORROW:
+                elif t == BTN_PLAN_TOMORROW or "завтра" in t_norm:
                     start_date = today_local + dt.timedelta(days=1)
-                elif t == BTN_PLAN_AFTER_TOMORROW:
+                elif t == BTN_PLAN_AFTER_TOMORROW or "послезавтра" in t_norm:
                     start_date = today_local + dt.timedelta(days=2)
                 elif t == BTN_PLAN_OTHER_DATE:
                     await user_repo.set_dialog(user, state="plan_date", step=0, data=None)
@@ -3104,8 +3115,31 @@ async def any_text(message: Message) -> None:
                     await message.answer("Введи дату (DD.MM или YYYY-MM-DD). Например: 03.02 или 2026-02-03.", reply_markup=main_menu_kb())
                     return
                 else:
-                    await message.answer("Выбери день кнопкой 👇", reply_markup=plan_when_kb())
-                    return
+                    # try parse date directly from free text
+                    s0 = t_norm
+                    start_date = None
+                    m1 = re.search(r"(\d{4})-(\d{2})-(\d{2})", s0)
+                    if m1:
+                        try:
+                            start_date = dt.date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
+                        except Exception:
+                            start_date = None
+                    if start_date is None:
+                        m2 = re.search(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?", s0)
+                        if m2:
+                            try:
+                                dd = int(m2.group(1))
+                                mm = int(m2.group(2))
+                                yy = int(m2.group(3)) if m2.group(3) else today_local.year
+                                start_date = dt.date(yy, mm, dd)
+                            except Exception:
+                                start_date = None
+                    if start_date is None:
+                        await message.answer("Выбери день кнопкой 👇 (или напиши: «завтра», «послезавтра», «03.02»).", reply_markup=plan_when_kb())
+                        return
+                    if start_date < today_local:
+                        await message.answer(f"Эта дата в прошлом ({start_date.isoformat()}). Выбери сегодня/будущую.", reply_markup=plan_when_kb())
+                        return
 
                 await user_repo.set_dialog(user, state="plan_store", step=0, data={"start_date": start_date.isoformat()})
                 await db.commit()
@@ -3297,7 +3331,16 @@ async def any_text(message: Message) -> None:
             )
             return
         if action == "plan_day":
-            await cmd_plan(message)
+            # Start interactive flow (date/store/days) for better UX
+            async with SessionLocal() as db:
+                user_repo = UserRepo(db)
+                user = await user_repo.get_or_create(message.from_user.id, message.from_user.username if message.from_user else None)
+                if not user.profile_complete:
+                    await message.answer("Сначала заполним профиль: /start")
+                    return
+                await user_repo.set_dialog(user, state="plan_when", step=0, data=None)
+                await db.commit()
+            await message.answer("📅 На какой день сделать рацион? 👇", reply_markup=plan_when_kb())
             return
         if action == "analyze_week":
             await cmd_week(message)

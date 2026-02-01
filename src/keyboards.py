@@ -106,7 +106,6 @@ def plan_when_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
         resize_keyboard=True,
-        one_time_keyboard=True,
         input_field_placeholder="На какой день?",
     )
 
@@ -119,7 +118,6 @@ def plan_days_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
         resize_keyboard=True,
-        one_time_keyboard=True,
         input_field_placeholder="На сколько дней?",
     )
 
@@ -134,7 +132,6 @@ def plan_store_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
         resize_keyboard=True,
-        one_time_keyboard=True,
         input_field_placeholder="Где покупаем?",
     )
 

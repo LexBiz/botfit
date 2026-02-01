@@ -92,29 +92,59 @@ class FoodService:
         img_url: str | None = None
         off_url: str | None = None
         barcode: str | None = None
+        best_name: str | None = None
         for c in cands:
             if img_url is None and c.image_url:
                 img_url = c.image_url
             if barcode is None and c.barcode:
                 barcode = c.barcode
+            if best_name is None and c.name:
+                best_name = c.name
             if off_url is None and c.barcode:
                 # concrete product page on OFF
                 base = "https://world.openfoodfacts.org"
                 off_url = f"{base}/product/{c.barcode}"
             if img_url and off_url:
                 break
+        search_query = barcode or best_name or query
         return {
             "img_url": img_url,
             "off_url": off_url,
             "barcode": barcode,
-            "store_url": make_store_search_url(store or "", query),
+            "search_query": search_query,
+            "store_url": make_store_search_url(store or "", search_query),
         }
+
+
+def _has_cyrillic(s: str) -> bool:
+    return any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in s)
+
+
+def _translit_ru(s: str) -> str:
+    # minimal RU->LAT translit for search safety
+    m = {
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z", "и": "i", "й": "y",
+        "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f",
+        "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    }
+    out = []
+    for ch in s:
+        lo = ch.lower()
+        if lo in m:
+            rep = m[lo]
+            out.append(rep.upper() if ch.isupper() else rep)
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def make_store_search_url(store: str, query: str) -> str:
     from urllib.parse import quote_plus
 
-    q = quote_plus(query)
+    q0 = (query or "").strip()
+    if _has_cyrillic(q0):
+        q0 = _translit_ru(q0)
+    q = quote_plus(q0)
     s = (store or "").strip().lower()
     # NOTE: Store sites change often; keep simple + safe fallbacks.
     if "kaufl" in s:
