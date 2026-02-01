@@ -2662,33 +2662,41 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                     macro_line = f"Целевые БЖУ: Б {mt.protein_g} / Ж {mt.fat_g} / У {mt.carbs_g} г.\n"
                 except Exception:
                     macro_line = ""
-            # retry once if model doesn't match targets or misses products/shopping list
+            # retry if model doesn't match targets or returns invalid JSON
             last_plan: dict[str, Any] | None = None
-            for attempt in range(2):
+            last_err: Exception | None = None
+            for attempt in range(3):
                 extra = "" if attempt == 0 else "\nВАЖНО: прошлый вариант не соответствовал целевым ккал/или не заполнил продукты/граммы. Исправь."
                 store_line = f"\nВАЖНО: покупка только в магазине: <b>{store_only}</b>. Все products[*].store и shopping_list[*].store должны быть строго '{store_only}'." if store_only else ""
-                plan = await text_json(
-                    system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
-                    user=(
-                        _profile_context(user)
-                        + "\nПредпочтения/режим дня (из БД):\n"
-                        + dumps(prefs)
-                        + f"\nСоставь рацион на {d.isoformat()} на <b>{kcal_target} ккал</b>.\n"
-                        + macro_line
-                        + store_line
-                        + "Требования:\n"
-                        + "- Сумма за день должна попасть в цель (допуск ±5%).\n"
-                        + "- Продукты реальные и типовые для Чехии (Lidl/Kaufland/Albert/PENNY).\n"
-                        + "- В каждом приёме пищи обязателен список продуктов с граммами.\n"
-                        + "- shopping_list обязателен.\n"
-                        + extra
-                    ),
-                    max_output_tokens=1500,
-                )
+                try:
+                    plan = await text_json(
+                        system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
+                        user=(
+                            _profile_context(user)
+                            + "\nПредпочтения/режим дня (из БД):\n"
+                            + dumps(prefs)
+                            + f"\nСоставь рацион на {d.isoformat()} на <b>{kcal_target} ккал</b>.\n"
+                            + macro_line
+                            + store_line
+                            + "Требования:\n"
+                            + "- Сумма за день должна попасть в цель (допуск ±5%).\n"
+                            + "- Продукты реальные и типовые для Чехии (Lidl/Kaufland/Albert/PENNY).\n"
+                            + "- В каждом приёме пищи обязателен список продуктов с граммами.\n"
+                            + "- shopping_list обязателен.\n"
+                            + extra
+                        ),
+                        max_output_tokens=1800,
+                    )
+                except Exception as e:
+                    last_err = e
+                    continue
                 last_plan = plan
                 if isinstance(plan, dict) and _plan_quality_ok(plan, kcal_target):
                     break
             plan = last_plan or {}
+            if not isinstance(plan, dict) or not plan.get("meals"):
+                if last_err:
+                    raise last_err
             day_plans.append(plan)
     except Exception as e:
         # Do NOT send low-quality plain-text plans (they break store constraints and product clarity).
@@ -3408,29 +3416,36 @@ async def any_text(message: Message) -> None:
 
             # Ask model to patch the plan
             last_plan: dict[str, Any] | None = None
-            for attempt in range(2):
+            last_err: Exception | None = None
+            for attempt in range(3):
                 extra = "" if attempt == 0 else "\nВАЖНО: прошлый вариант не попал в цели ккал/продукты. Исправь и пересчитай."
-                patched = await text_json(
-                    system=f"{SYSTEM_COACH}\n\n{PLAN_EDIT_JSON}",
-                    user=(
-                        _profile_context(user)
-                        + "\nПредпочтения/режим дня (из БД):\n"
-                        + dumps(prefs)
-                        + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
-                        + store_line
-                        + f"\nТекущий план на {edit_date.isoformat()}:\n"
-                        + dumps(current)
-                        + "\n\nПросьба пользователя:\n"
-                        + t0
-                        + extra
-                    ),
-                    max_output_tokens=1500,
-                )
+                try:
+                    patched = await text_json(
+                        system=f"{SYSTEM_COACH}\n\n{PLAN_EDIT_JSON}",
+                        user=(
+                            _profile_context(user)
+                            + "\nПредпочтения/режим дня (из БД):\n"
+                            + dumps(prefs)
+                            + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
+                            + store_line
+                            + f"\nТекущий план на {edit_date.isoformat()}:\n"
+                            + dumps(current)
+                            + "\n\nПросьба пользователя:\n"
+                            + t0
+                            + extra
+                        ),
+                        max_output_tokens=1800,
+                    )
+                except Exception as e:
+                    last_err = e
+                    continue
                 if isinstance(patched, dict):
                     last_plan = patched
                     if _plan_quality_ok(patched, kcal_target):
                         break
             new_plan = last_plan or current
+            if (not isinstance(new_plan, dict) or not new_plan.get("meals")) and last_err:
+                raise last_err
             await plan_repo.upsert_day_plan(user_id=user.id, date=edit_date, calories_target=kcal_target, plan=new_plan)
             await db.commit()
 
