@@ -2685,7 +2685,8 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                             + "- shopping_list обязателен.\n"
                             + extra
                         ),
-                        max_output_tokens=1800,
+                        model=settings.openai_plan_model,
+                        max_output_tokens=1600,
                     )
                 except Exception as e:
                     last_err = e
@@ -3434,7 +3435,8 @@ async def any_text(message: Message) -> None:
                             + t0
                             + extra
                         ),
-                        max_output_tokens=1800,
+                        model=settings.openai_plan_model,
+                        max_output_tokens=1600,
                     )
                 except Exception as e:
                     last_err = e
