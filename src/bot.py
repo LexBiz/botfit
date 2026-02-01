@@ -518,6 +518,82 @@ def _looks_like_full_regen(txt: str) -> bool:
     t = _norm_text(txt or "")
     return any(k in t for k in ["полностью", "переделай", "пересобери", "с нуля", "сделай по-другому", "вкуснее", "разнообраз"])
 
+
+def _parse_hhmm(t: str) -> tuple[int, int] | None:
+    if not isinstance(t, str):
+        return None
+    s = t.strip()
+    if not re.fullmatch(r"\d{2}:\d{2}", s):
+        return None
+    return int(s[:2]), int(s[3:5])
+
+
+def _complete_meal_times(times: list[str]) -> list[str]:
+    """
+    Ensure the schedule covers the whole day.
+    If user provided only morning slots, append lunch/dinner defaults.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in times:
+        tt = t.strip()
+        if _parse_hhmm(tt) and tt not in seen:
+            out.append(tt)
+            seen.add(tt)
+
+    # if nothing provided, use sane default
+    if not out:
+        return ["08:00", "12:30", "16:30", "19:30"]
+
+    # compute last hour
+    last = _parse_hhmm(out[-1])
+    last_h = last[0] if last else 0
+
+    # If last meal is too early, append lunch/dinner slots.
+    if last_h < 14 and "14:30" not in seen:
+        out.append("14:30")
+        seen.add("14:30")
+        last_h = 14
+    if last_h < 18 and "18:30" not in seen:
+        out.append("18:30")
+        seen.add("18:30")
+        last_h = 18
+    if last_h < 20 and "20:30" not in seen:
+        out.append("20:30")
+        seen.add("20:30")
+
+    # keep max 6 slots
+    return out[:6]
+
+
+def _plan_totals_kcal(plan: dict[str, Any]) -> float:
+    try:
+        t = plan.get("totals") if isinstance(plan.get("totals"), dict) else {}
+        kcal = _coerce_number((t or {}).get("kcal"))
+        if kcal is not None:
+            return float(kcal)
+    except Exception:
+        pass
+    # fallback: sum meals
+    try:
+        return float(sum(float(_coerce_number((m or {}).get("kcal")) or 0) for m in (plan.get("meals") or [])))
+    except Exception:
+        return 0.0
+
+
+def _plan_last_hour(plan: dict[str, Any]) -> int:
+    try:
+        meals = plan.get("meals") or []
+        last_t = ""
+        for m in meals:
+            t = str((m or {}).get("time") or "").strip()
+            if _parse_hhmm(t):
+                last_t = t
+        hhmm = _parse_hhmm(last_t) if last_t else None
+        return int(hhmm[0]) if hhmm else 0
+    except Exception:
+        return 0
+
 def _active_targets(
     *,
     prefs: dict[str, Any],
@@ -2902,7 +2978,8 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             last_err: Exception | None = None
             # Use user's routine if present
             mt = prefs.get("meal_times") if isinstance(prefs.get("meal_times"), list) else None
-            meal_times = [t for t in (mt or []) if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip())][:8]
+            meal_times0 = [t for t in (mt or []) if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip())][:8]
+            meal_times = _complete_meal_times([str(x) for x in meal_times0])
             routine_line = ""
             if meal_times:
                 routine_line = "\nРежим пользователя: используй эти времена приёмов пищи (строго): " + ", ".join(meal_times) + "."
@@ -2921,6 +2998,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                 + "- shopping_list обязателен и тоже (русский + чешский).\n"
                 + "- Никаких спорт-добавок (whey/протеин/креатин/гейнер).\n"
                 + "- Рацион должен быть сытный, вкусный, без повторов блюд (по возможности), с овощами/клетчаткой.\n"
+                + "- День должен быть закрыт до вечера: последняя еда после 18:00.\n"
             )
 
             # Speed + cost: try fast model first, then fallback to high-quality model.
@@ -2954,16 +3032,39 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                     continue
                 plan = _normalize_day_plan(plan_raw)
                 last_plan = plan
-                if _plan_quality_ok(plan, kcal_target):
+                if _plan_quality_ok(plan, kcal_target) and _plan_last_hour(plan) >= 18:
                     break
             if last_plan is None:
                 raise last_err or RuntimeError("Plan generation failed")
-            # If we still didn't hit quality after retries, do NOT fail hard.
-            # We'll send the plan anyway (user asked for "always works"), but log a warning.
-            if not _plan_quality_ok(last_plan, kcal_target):
+            # Auto-fix pass: if plan is far from target or ends too early, ask the model to adjust.
+            needs_fix = (not _plan_quality_ok(last_plan, kcal_target)) or (_plan_last_hour(last_plan) < 18) or (_plan_totals_kcal(last_plan) < float(kcal_target) * 0.90)
+            if needs_fix:
+                fix_prompt = (
+                    _profile_context(user)
+                    + "\nПредпочтения/режим дня (из БД):\n"
+                    + dumps(prefs)
+                    + f"\nЦель: {kcal_target} ккал. {macro_line}"
+                    + (("\nВремена приёмов пищи (строго): " + ", ".join(meal_times) + ".\n") if meal_times else "")
+                    + "\nТекущий черновик плана (его надо исправить):\n"
+                    + dumps(last_plan)
+                    + "\n\nЗадача: исправь план так, чтобы:\n"
+                    + "- ИТОГО дня было близко к цели (допуск ±7%)\n"
+                    + "- День был закрыт до вечера (последняя еда после 18:00)\n"
+                    + "- Сохрани рус+чеш названия, граммовки, рецепты\n"
+                    + "- Если калорий не хватает — добавь 1-2 приёма пищи и/или увеличь порции\n"
+                    + "- Верни строго JSON по схеме.\n"
+                )
                 try:
-                    got = _coerce_number(((last_plan.get("totals") or {}) if isinstance(last_plan.get("totals"), dict) else {}).get("kcal"))
-                    print("PLAN_QUALITY_WARN:", {"target": kcal_target, "got": got, "date": d.isoformat()})
+                    fixed_raw = await text_json(
+                        system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
+                        user=fix_prompt,
+                        model=settings.openai_plan_model,
+                        max_output_tokens=2800,
+                        timeout_s=getattr(settings, "openai_plan_timeout_s", 60),
+                    )
+                    if isinstance(fixed_raw, dict):
+                        fixed = _normalize_day_plan(fixed_raw)
+                        last_plan = fixed
                 except Exception:
                     pass
             plan = last_plan
