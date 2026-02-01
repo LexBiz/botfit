@@ -148,6 +148,11 @@ def _sanitize_ai_text(s: str) -> str:
     return t
 
 
+def _safe_nonempty_text(s: str | None, *, fallback: str) -> str:
+    t = (s or "").strip()
+    return t if t else fallback
+
+
 def _has_cyrillic_text(s: str) -> bool:
     return any("а" <= ch.lower() <= "я" or ch.lower() == "ё" for ch in (s or ""))
 
@@ -190,7 +195,7 @@ async def _send_plans(
     user: Any,
     start_date: dt.date,
     day_plans: list[dict[str, Any]],
-    prefs: dict[str, Any],
+    store_only: str | None,
 ) -> None:
     food_service = FoodService(FoodRepo(db))
 
@@ -216,13 +221,10 @@ async def _send_plans(
         return f"Купить: ~{buy:.0f} г ({packs}×{step:.0f} г) — ориентир"
 
     # aggregate shopping list across days
-    store_only = None
-    try:
-        store_only = str(prefs.get("preferred_store") or "").strip() or None
+    if store_only:
+        store_only = str(store_only).strip() or None
         if store_only and store_only.lower() == "any":
             store_only = None
-    except Exception:
-        store_only = None
 
     agg: dict[tuple[str, str], float] = {}
     display: dict[tuple[str, str], str] = {}
@@ -2170,7 +2172,8 @@ async def _handle_coach_chat(
         user="Контекст (из БД):\n" + dumps(ctx) + "\n\nВопрос пользователя:\n" + q,
         max_output_tokens=900,
     )
-    await message.answer(_sanitize_ai_text(ans)[:3900], reply_markup=main_menu_kb())
+    out = _safe_nonempty_text(_sanitize_ai_text(ans), fallback="⚠️ Похоже, ответ получился пустым. Попробуй ещё раз (или нажми 🏠 Меню).")
+    await message.answer(out[:3900], reply_markup=main_menu_kb())
     return True
 
 
@@ -2586,41 +2589,28 @@ async def cmd_plan(message: Message) -> None:
             await message.answer("Сначала заполним профиль: /start")
             return
 
-        days = 1
+        # Keep /plan interactive (date -> store -> days), but allow /plan N to prefill days.
+        days_prefill: int | None = None
         if message.text:
             parts = message.text.strip().split()
             if len(parts) >= 2 and parts[1].isdigit():
-                days = max(1, min(int(parts[1]), 7))
+                days_prefill = max(1, min(int(parts[1]), 7))
 
-        # Use user's local date as start
-        pref_repo = PreferenceRepo(db)
-        prefs = await pref_repo.get_json(user.id)
-        tz = _tz_from_prefs(prefs)
-        start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
-        await user_repo.set_dialog(
-            user,
-            state="plan_generating",
-            step=0,
-            data={"start_date": start_date.isoformat(), "days": days, "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
-        )
+        await user_repo.set_dialog(user, state="plan_when", step=0, data={"days_prefill": days_prefill} if days_prefill else None)
         await db.commit()
-        await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=cancel_kb())
-        await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date)
+        await message.answer("📅 На какой день сделать рацион?", reply_markup=plan_when_kb())
         return
 
 
-async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int, start_date: dt.date) -> None:
+async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int, start_date: dt.date, store_only: str | None) -> None:
     plan_repo = PlanRepo(db)
     pref_repo = PreferenceRepo(db)
     prefs = await pref_repo.get_json(user.id)
-    # store preference
-    store_only = None
-    try:
-        store_only = str(prefs.get("preferred_store") or "").strip() or None
+    # store constraint is per-generation (do NOT persist as user preference)
+    if store_only:
+        store_only = str(store_only).strip() or None
         if store_only and store_only.lower() == "any":
             store_only = None
-    except Exception:
-        store_only = None
 
     # choose target kcal/macros: prefer explicit targets from prefs (incl weekday/weekend)
     targ = prefs.get("targets") if isinstance(prefs.get("targets"), dict) else {}
@@ -2706,7 +2696,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         # Instead, keep user in "plan_edit" mode with a clear retry action.
         try:
             user_repo = UserRepo(db)
-            await user_repo.set_dialog(user, state="plan_edit", step=0, data={"start_date": start_date.isoformat(), "days": days})
+            await user_repo.set_dialog(user, state="plan_edit", step=0, data={"start_date": start_date.isoformat(), "days": days, "store_only": store_only or "any"})
             await db.commit()
         except Exception:
             pass
@@ -2729,7 +2719,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             plan=plan,
         )
     await db.commit()
-    await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans, prefs=prefs)
+    await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans, store_only=store_only)
 
     # enter "plan_edit" mode so the user can iteratively tweak the plan
     try:
@@ -2738,7 +2728,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             user,
             state="plan_edit",
             step=0,
-            data={"start_date": start_date.isoformat(), "days": days},
+            data={"start_date": start_date.isoformat(), "days": days, "store_only": store_only or "any"},
         )
         await db.commit()
         await message.answer(
@@ -2754,7 +2744,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
     try:
         user_repo = UserRepo(db)
         if user.dialog_state == "plan_generating":
-            await user_repo.set_dialog(user, state="plan_edit", step=0, data={"start_date": start_date.isoformat(), "days": days})
+            await user_repo.set_dialog(user, state="plan_edit", step=0, data={"start_date": start_date.isoformat(), "days": days, "store_only": store_only or "any"})
             await db.commit()
     except Exception:
         pass
@@ -2845,7 +2835,8 @@ async def cmd_week(message: Message) -> None:
                 user=_profile_context(user) + "\nДневник за 7 дней:\n" + dumps(diary),
                 max_output_tokens=1200,
             )
-            await message.answer(_sanitize_ai_text(txt)[:3900], reply_markup=main_menu_kb())
+            out = _safe_nonempty_text(_sanitize_ai_text(txt), fallback="⚠️ Не смог получить текст анализа. Попробуй ещё раз через пару секунд.")
+            await message.answer(out[:3900], reply_markup=main_menu_kb())
             return
 
         parts = [
@@ -3210,6 +3201,12 @@ async def any_text(message: Message) -> None:
             today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
 
             if user.dialog_state == "plan_when":
+                # keep any prefills (e.g. /plan N)
+                try:
+                    prev_data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+                except Exception:
+                    prev_data = {}
+
                 t_norm = _norm_text(t)
                 # accept free-form text too
                 if t == BTN_PLAN_TODAY or "сегодня" in t_norm:
@@ -3219,7 +3216,8 @@ async def any_text(message: Message) -> None:
                 elif t == BTN_PLAN_AFTER_TOMORROW or "послезавтра" in t_norm:
                     start_date = today_local + dt.timedelta(days=2)
                 elif t == BTN_PLAN_OTHER_DATE:
-                    await user_repo.set_dialog(user, state="plan_date", step=0, data=None)
+                    keep = prev_data if isinstance(prev_data, dict) and prev_data else None
+                    await user_repo.set_dialog(user, state="plan_date", step=0, data=keep)
                     await db.commit()
                     await message.answer("Введи дату (DD.MM или YYYY-MM-DD). Например: 03.02 или 2026-02-03.", reply_markup=main_menu_kb())
                     return
@@ -3250,12 +3248,19 @@ async def any_text(message: Message) -> None:
                         await message.answer(f"Эта дата в прошлом ({start_date.isoformat()}). Выбери сегодня/будущую.", reply_markup=plan_when_kb())
                         return
 
-                await user_repo.set_dialog(user, state="plan_store", step=0, data={"start_date": start_date.isoformat()})
+                data2: dict[str, Any] = {"start_date": start_date.isoformat()}
+                if isinstance(prev_data, dict) and isinstance(prev_data.get("days_prefill"), int):
+                    data2["days_prefill"] = prev_data.get("days_prefill")
+                await user_repo.set_dialog(user, state="plan_store", step=0, data=data2)
                 await db.commit()
                 await message.answer(f"🛒 Ок. Старт: <b>{start_date.isoformat()}</b>.\nГде покупаем?", reply_markup=plan_store_kb())
                 return
 
             if user.dialog_state == "plan_date":
+                try:
+                    prev_data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+                except Exception:
+                    prev_data = {}
                 s0 = _norm_text(t)
                 start_date: dt.date | None = None
                 # YYYY-MM-DD
@@ -3284,7 +3289,10 @@ async def any_text(message: Message) -> None:
                     await message.answer(f"Эта дата в прошлом ({start_date.isoformat()}). Введи будущую/сегодня.", reply_markup=main_menu_kb())
                     return
 
-                await user_repo.set_dialog(user, state="plan_store", step=0, data={"start_date": start_date.isoformat()})
+                data2: dict[str, Any] = {"start_date": start_date.isoformat()}
+                if isinstance(prev_data, dict) and isinstance(prev_data.get("days_prefill"), int):
+                    data2["days_prefill"] = prev_data.get("days_prefill")
+                await user_repo.set_dialog(user, state="plan_store", step=0, data=data2)
                 await db.commit()
                 await message.answer(f"🛒 Ок. Старт: <b>{start_date.isoformat()}</b>.\nГде покупаем?", reply_markup=plan_store_kb())
                 return
@@ -3306,39 +3314,51 @@ async def any_text(message: Message) -> None:
                     await message.answer("Выбери магазин кнопкой 👇", reply_markup=plan_store_kb())
                     return
 
-                # persist preference as default for future plans
-                try:
-                    pref_repo = PreferenceRepo(db)
-                    await pref_repo.merge(user.id, {"preferred_store": store_choice})
-                except Exception:
-                    pass
-
                 start_date = today_local
+                days_prefill: int | None = None
                 try:
                     data = loads(user.dialog_data_json) if user.dialog_data_json else {}
                     sd = (data or {}).get("start_date")
                     if isinstance(sd, str):
                         start_date = dt.date.fromisoformat(sd)
+                    dp = (data or {}).get("days_prefill")
+                    if isinstance(dp, int) and 1 <= dp <= 7:
+                        days_prefill = dp
                 except Exception:
                     pass
 
-                await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat(), "preferred_store": store_choice})
+                data2: dict[str, Any] = {"start_date": start_date.isoformat(), "store_only": store_choice}
+                if days_prefill is not None:
+                    data2["days_prefill"] = days_prefill
+                await user_repo.set_dialog(user, state="plan_days", step=0, data=data2)
                 await db.commit()
                 await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b> | 🛒 Магазин: <b>{store_choice}</b>\nНа сколько дней? (1-7)", reply_markup=plan_days_kb())
                 return
 
             if user.dialog_state == "plan_days":
                 n = _parse_int(t)
+                if n is None:
+                    try:
+                        data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+                        dp = (data or {}).get("days_prefill")
+                        if isinstance(dp, int) and 1 <= dp <= 7:
+                            n = dp
+                    except Exception:
+                        n = None
                 if n is None or not (1 <= n <= 7):
                     await message.answer("Напиши число от 1 до 7 (или выбери кнопку).", reply_markup=plan_days_kb())
                     return
                 # pull start_date from dialog data (default: today_local)
                 start_date = today_local
+                store_only: str | None = None
                 try:
                     data = loads(user.dialog_data_json) if user.dialog_data_json else {}
                     sd = (data or {}).get("start_date")
                     if isinstance(sd, str):
                         start_date = dt.date.fromisoformat(sd)
+                    so = (data or {}).get("store_only")
+                    if isinstance(so, str) and so.strip():
+                        store_only = so.strip()
                 except Exception:
                     pass
 
@@ -3347,11 +3367,11 @@ async def any_text(message: Message) -> None:
                     user,
                     state="plan_generating",
                     step=0,
-                    data={"start_date": start_date.isoformat(), "days": n, "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
+                    data={"start_date": start_date.isoformat(), "days": n, "store_only": store_only or "any", "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
                 )
                 await db.commit()
                 await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=cancel_kb())
-                await _generate_plan_for_days(message, db=db, user=user, days=n, start_date=start_date)
+                await _generate_plan_for_days(message, db=db, user=user, days=n, start_date=start_date, store_only=store_only)
                 return
 
         # plan_edit dialog (iterative tweaks)
@@ -3372,9 +3392,12 @@ async def any_text(message: Message) -> None:
                 tz = _tz_from_prefs(prefs)
                 start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
             days = int((data or {}).get("days") or 1)
+            store_only = str((data or {}).get("store_only") or "any").strip()
+            if store_only.lower() == "any":
+                store_only = "any"
 
             if t0 == BTN_PLAN_REGEN:
-                await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date)
+                await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date, store_only=store_only)
                 return
 
             if t0 == BTN_PLAN_APPROVE:
@@ -3414,7 +3437,6 @@ async def any_text(message: Message) -> None:
                 await message.answer("Не вижу целевую норму калорий. Открой 👤 Профиль и зафиксируй цели.", reply_markup=main_menu_kb())
                 return
 
-            store_only = str(prefs.get("preferred_store") or "any")
             store_line = "" if store_only.lower() == "any" else f"Покупка только в магазине: {store_only}."
 
             # Ask model to patch the plan
@@ -3457,7 +3479,7 @@ async def any_text(message: Message) -> None:
 
             # Reload all days and show updated plan + shopping list
             day_plans = await _load_day_plans(plan_repo=plan_repo, user_id=user.id, start_date=start_date, days=days)
-            await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans, prefs=prefs)
+            await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans, store_only=store_only)
             await message.answer("🛠️ Ок! Поменял. Хочешь ещё правки? Пиши текстом или жми ✅ Утвердить.", reply_markup=plan_edit_kb())
             return
 
