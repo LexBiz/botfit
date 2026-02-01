@@ -2694,10 +2694,12 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                 last_plan = plan
                 if isinstance(plan, dict) and _plan_quality_ok(plan, kcal_target):
                     break
-            plan = last_plan or {}
-            if not isinstance(plan, dict) or not plan.get("meals"):
-                if last_err:
-                    raise last_err
+            if last_plan is None:
+                raise last_err or RuntimeError("Plan generation failed")
+            # If we still didn't hit quality after retries, treat as failure (don't send partial plan)
+            if not _plan_quality_ok(last_plan, kcal_target):
+                raise RuntimeError(f"Plan quality not OK for target {kcal_target}")
+            plan = last_plan
             day_plans.append(plan)
     except Exception as e:
         # Do NOT send low-quality plain-text plans (they break store constraints and product clarity).
@@ -3445,9 +3447,11 @@ async def any_text(message: Message) -> None:
                     last_plan = patched
                     if _plan_quality_ok(patched, kcal_target):
                         break
-            new_plan = last_plan or current
-            if (not isinstance(new_plan, dict) or not new_plan.get("meals")) and last_err:
-                raise last_err
+            if last_plan is None:
+                raise last_err or RuntimeError("Plan edit failed")
+            if not _plan_quality_ok(last_plan, kcal_target):
+                raise RuntimeError(f"Plan edit quality not OK for target {kcal_target}")
+            new_plan = last_plan
             await plan_repo.upsert_day_plan(user_id=user.id, date=edit_date, calories_target=kcal_target, plan=new_plan)
             await db.commit()
 

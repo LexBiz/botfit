@@ -13,8 +13,8 @@ class Settings(BaseSettings):
     openai_text_model: str = Field(default="gpt-5.2", validation_alias="OPENAI_TEXT_MODEL")
     openai_vision_model: str = Field(default="gpt-5.2", validation_alias="OPENAI_VISION_MODEL")
     openai_transcribe_model: str = Field(default="gpt-4o-mini-transcribe", validation_alias="OPENAI_TRANSCRIBE_MODEL")
-    # Cheaper model for heavy JSON plans (can be overridden in .env)
-    openai_plan_model: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_PLAN_MODEL")
+    # Model for heavy JSON plans (can be overridden in .env)
+    openai_plan_model: str = Field(default="gpt-5.2", validation_alias="OPENAI_PLAN_MODEL")
     # Hard timeout for OpenAI requests (seconds) to avoid "hangs"
     openai_timeout_s: int = Field(default=45, validation_alias="OPENAI_TIMEOUT_S")
 
