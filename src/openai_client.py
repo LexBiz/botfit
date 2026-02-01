@@ -318,7 +318,7 @@ async def text_json(
                 model=m,
                 messages=retry_messages,
                 max_output_tokens=max_output_tokens,
-                response_format=None,
+                response_format={"type": "json_object"},
                 timeout_s=timeout_s,
             )
             obj2 = _try_parse_json(text2)
