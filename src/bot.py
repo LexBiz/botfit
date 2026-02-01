@@ -25,6 +25,7 @@ from src.openai_client import text_json, text_output, transcribe_audio, vision_j
 from src.prompts import (
     COACH_ONBOARD_JSON,
     COACH_MEMORY_JSON,
+    COACH_CHAT_GUIDE,
     DAY_PLAN_JSON,
     MEAL_ITEMS_JSON,
     MEAL_FROM_PHOTO_FINAL_JSON,
@@ -1329,6 +1330,21 @@ async def _agent_route(text: str, user: Any) -> dict[str, Any] | None:
         return None
 
 
+def _looks_like_meal(text: str) -> bool:
+    t = _norm_text(text)
+    if not t:
+        return False
+    # grams / quantities / typical food markers
+    if re.search(r"\b\d+\s?(г|гр|kg|кг|ml|мл|шт)\b", t):
+        return True
+    if any(k in t for k in ["съел", "поел", "ел ", "завтрак", "обед", "ужин", "перекус", "греч", "куриц", "рис", "паста", "йогур", "творог", "омлет"]):
+        return True
+    # list-like: commas with numbers
+    if "," in t and re.search(r"\d", t):
+        return True
+    return False
+
+
 def _parse_dt(s: str | None) -> dt.datetime | None:
     if not s or not isinstance(s, str):
         return None
@@ -1454,6 +1470,76 @@ async def _handle_recall_plan(message: Message, *, plan_repo: PlanRepo, user: An
         + ("<b>Рецепт</b>:\n" + "\n".join([f"- {s}" for s in recipe]) if recipe else "")
     )
     await message.answer(text[:3900], reply_markup=main_menu_kb())
+    return True
+
+
+async def _handle_coach_chat(
+    message: Message,
+    *,
+    pref_repo: PreferenceRepo,
+    meal_repo: MealRepo,
+    plan_repo: PlanRepo,
+    user: Any,
+) -> bool:
+    q = (message.text or "").strip()
+    if not q:
+        return False
+
+    prefs = await pref_repo.get_json(user.id)
+    today_plan = await plan_repo.get_day_plan_json(user.id, dt.date.today())
+    last_meals = await meal_repo.last_meals(user.id, limit=12)
+    meals_json = [
+        {
+            "created_at": m.created_at.isoformat(),
+            "source": m.source,
+            "calories": m.calories,
+            "protein_g": m.protein_g,
+            "fat_g": m.fat_g,
+            "carbs_g": m.carbs_g,
+            "description_raw": m.description_raw,
+        }
+        for m in last_meals
+    ]
+
+    # add computed targets meta if possible (truth / hard numbers)
+    try:
+        deficit_pct = prefs.get("deficit_pct")
+        _, meta = compute_targets_with_meta(
+            sex=user.sex,  # type: ignore[arg-type]
+            age=user.age,
+            height_cm=user.height_cm,
+            weight_kg=user.weight_kg,
+            activity=user.activity_level,  # type: ignore[arg-type]
+            goal=user.goal,  # type: ignore[arg-type]
+            deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
+        )
+        calc_meta = {"bmr_kcal": meta.bmr_kcal, "tdee_kcal": meta.tdee_kcal, "deficit_pct": meta.deficit_pct, "deficit_kcal": meta.deficit_kcal}
+    except Exception:
+        calc_meta = None
+
+    ctx = {
+        "profile": {
+            "age": user.age,
+            "sex": user.sex,
+            "height_cm": user.height_cm,
+            "weight_kg": user.weight_kg,
+            "activity_level": user.activity_level,
+            "goal": user.goal,
+            "calories_target": user.calories_target,
+            "macros_target": [user.protein_g_target, user.fat_g_target, user.carbs_g_target],
+        },
+        "calc_meta": calc_meta,
+        "preferences": prefs,
+        "today_plan": today_plan,
+        "recent_meals": meals_json,
+    }
+
+    ans = await text_output(
+        system=f"{SYSTEM_COACH}\n\n{COACH_CHAT_GUIDE}",
+        user="Контекст (из БД):\n" + dumps(ctx) + "\n\nВопрос пользователя:\n" + q,
+        max_output_tokens=900,
+    )
+    await message.answer(ans[:3900], reply_markup=main_menu_kb())
     return True
 
 
@@ -1970,12 +2056,28 @@ async def any_text(message: Message) -> None:
             if handled:
                 await db.commit()
                 return
+        if action == "coach_chat":
+            pref_repo = PreferenceRepo(db)
+            plan_repo = PlanRepo(db)
+            handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, user=user)
+            if handled:
+                await db.commit()
+                return
         if action == "unknown":
             note = (route or {}).get("note") or "Уточни, что именно сделать?"
             await message.answer(str(note))
             return
 
-        # Default: log meal
+        # Default fallback: if it doesn't look like a meal, answer as coach
+        if not _looks_like_meal(user_text):
+            pref_repo = PreferenceRepo(db)
+            plan_repo = PlanRepo(db)
+            handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, user=user)
+            if handled:
+                await db.commit()
+                return
+
+        # Otherwise: treat as meal
         meal_text = (route or {}).get("meal_text") or user_text
 
         # Text -> items (GPT) -> macros (OpenFoodFacts)
