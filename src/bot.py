@@ -2621,12 +2621,20 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
     items_sorted = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
     shopping_lines: list[str] = []
     for (norm, store), grams in items_sorted[:25]:
-        display_name = display.get((norm, store), norm)
-        assets = await food_service.best_product_assets(display_name, store=store)
+        orig_name = display.get((norm, store), norm)
+        assets = await food_service.best_product_assets(orig_name, store=store)
         img_url = assets.get("img_url")
         off_url = assets.get("off_url")
-        store_url = assets.get("store_url") or make_store_search_url(store, display_name)
+        store_url = assets.get("store_url") or make_store_search_url(store, orig_name)
+        best_name = assets.get("best_name")
+        brand = assets.get("brand")
         search_query = assets.get("search_query")
+        display_name = orig_name
+        # Prefer concrete OFF name (often Czech/Latin) for clarity + matching photos
+        if isinstance(best_name, str) and best_name.strip():
+            display_name = best_name.strip()
+        if isinstance(brand, str) and brand.strip():
+            display_name = f"{brand.strip()} — {display_name}"
         # If display_name is Cyrillic and we have a better non-cyrillic search_query, prefer it for store URL
         if _has_cyrillic_text(display_name):
             sq = assets.get("search_query")
@@ -2641,8 +2649,8 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         if isinstance(off_url, str) and off_url:
             links.append(f"<a href=\"{off_url}\">🔎 OFF</a>")
         q_hint = ""
-        if isinstance(search_query, str) and search_query and (store or "").lower().startswith("kaufl"):
-            # Kaufland catalog may not support deep-link search reliably; give exact query to paste.
+        if isinstance(search_query, str) and search_query:
+            # Always provide exact query to paste into store site/app search (EAN preferred)
             q_hint = f" 🔎 запрос: <code>{search_query}</code>"
         shopping_lines.append(
             f"- <b>{display_name}</b> — {grams:.0f} г ({store}). {buy_hint}. "

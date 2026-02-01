@@ -112,11 +112,14 @@ class FoodService:
         if barcode:
             off_url = f"https://world.openfoodfacts.org/product/{barcode}"
         best_name: str | None = best.name if best and best.name else None
+        brand: str | None = best.brand if best and best.brand else None
         search_query = barcode or best_name or query
         return {
             "img_url": img_url,
             "off_url": off_url,
             "barcode": barcode,
+            "best_name": best_name,
+            "brand": brand,
             "search_query": search_query,
             "store_url": make_store_search_url(store or "", search_query),
         }
