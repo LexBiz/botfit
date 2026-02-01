@@ -2916,7 +2916,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                         system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
                         user=user_prompt,
                         model=m,
-                        max_output_tokens=1400,
+                        max_output_tokens=2200,
                         timeout_s=getattr(settings, "openai_plan_timeout_s", 30),
                     )
                 except Exception as e:
