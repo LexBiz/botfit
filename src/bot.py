@@ -295,6 +295,9 @@ def _normalize_day_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "products": norm_prods,
             "recipe_ru": recipe2,
         }
+        # If kcal missing, try compute from macros.
+        if kcal is None and prot is not None and fat is not None and carbs is not None:
+            kcal = float(prot) * 4.0 + float(fat) * 9.0 + float(carbs) * 4.0
         if kcal is not None:
             nm["kcal"] = float(kcal)
         if prot is not None:
@@ -314,7 +317,11 @@ def _normalize_day_plan(plan: dict[str, Any]) -> dict[str, Any]:
     tot_f = _coerce_number(totals.get("fat_g"))
     tot_c = _coerce_number(totals.get("carbs_g"))
     if tot_kcal is None:
+        # first try sum of meal kcal
         tot_kcal = sum(float(mm.get("kcal") or 0) for mm in norm_meals)
+        # if still empty/zero, compute from macros if available
+        if (not tot_kcal) and tot_p is not None and tot_f is not None and tot_c is not None:
+            tot_kcal = float(tot_p) * 4.0 + float(tot_f) * 9.0 + float(tot_c) * 4.0
     norm_totals: dict[str, Any] = {"kcal": float(tot_kcal)}
     if tot_p is not None:
         norm_totals["protein_g"] = float(tot_p)
@@ -2924,9 +2931,14 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                     break
             if last_plan is None:
                 raise last_err or RuntimeError("Plan generation failed")
-            # If we still didn't hit quality after retries, treat as failure (don't send partial plan)
+            # If we still didn't hit quality after retries, do NOT fail hard.
+            # We'll send the plan anyway (user asked for "always works"), but log a warning.
             if not _plan_quality_ok(last_plan, kcal_target):
-                raise RuntimeError(f"Plan quality not OK for target {kcal_target}")
+                try:
+                    got = _coerce_number(((last_plan.get("totals") or {}) if isinstance(last_plan.get("totals"), dict) else {}).get("kcal"))
+                    print("PLAN_QUALITY_WARN:", {"target": kcal_target, "got": got, "date": d.isoformat()})
+                except Exception:
+                    pass
             plan = last_plan
             day_plans.append(plan)
     except Exception as e:
