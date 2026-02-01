@@ -14,6 +14,9 @@ BTN_PROGRESS = "📷📏 Прогресс"
 BTN_HELP = "❓ Помощь"
 BTN_MENU = "🏠 Меню"
 
+BTN_TARGETS_AUTO = "✅ Использовать расчёт тренера"
+BTN_TARGETS_CUSTOM = "✍️ Я задам калории/КБЖУ сам"
+
 
 MAIN_BUTTONS: list[list[str]] = [
     [BTN_PROFILE, BTN_WEIGHT],
@@ -62,5 +65,18 @@ def goal_tempo_kb(preview_kcal: dict[str, int] | None = None) -> ReplyKeyboardMa
         resize_keyboard=True,
         one_time_keyboard=True,
         input_field_placeholder="Выбери темп",
+    )
+
+
+def targets_mode_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_TARGETS_AUTO],
+        [BTN_TARGETS_CUSTOM],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Как задаём калории?",
     )
 

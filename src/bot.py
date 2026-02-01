@@ -20,7 +20,7 @@ from src.init_db import init_db
 from src.jsonutil import dumps, loads
 from aiogram.types import ReplyKeyboardRemove
 
-from src.nutrition import compute_targets, compute_targets_with_meta
+from src.nutrition import compute_targets, compute_targets_with_meta, macros_for_targets
 from src.audio import ogg_opus_to_wav_bytes
 from src.openai_client import text_json, text_output, transcribe_audio, vision_json
 from src.prompts import (
@@ -50,10 +50,13 @@ from src.keyboards import (
     BTN_PROFILE,
     BTN_PROGRESS,
     BTN_REMINDERS,
+    BTN_TARGETS_AUTO,
+    BTN_TARGETS_CUSTOM,
     BTN_WEEK,
     BTN_WEIGHT,
     goal_tempo_kb,
     main_menu_kb,
+    targets_mode_kb,
 )
 from src.render import recipe_table
 from src.recipe_calc import compute_totals, parse_ingredients_block
@@ -744,6 +747,8 @@ async def _handle_coach_onboarding(message: Message, user_repo: UserRepo, user: 
             "deficit_pct": meta.deficit_pct,
             "bmr_kcal": meta.bmr_kcal,
             "tdee_kcal": meta.tdee_kcal,
+            # default targets from coach calculation (can be overridden by custom targets later)
+            "targets": {"calories": t.calories, "protein_g": t.protein_g, "fat_g": t.fat_g, "carbs_g": t.carbs_g},
         },
     )
     # durable coach memory
@@ -765,14 +770,14 @@ async def _handle_coach_onboarding(message: Message, user_repo: UserRepo, user: 
     except Exception:
         pass
 
-    await user_repo.set_dialog(user, state=None, step=None, data=None)
+    # Next: choose targets mode (coach calculation vs custom calories)
+    await user_repo.set_dialog(user, state="targets_mode", step=0, data={"coach_targets": {"calories": t.calories, "p": t.protein_g, "f": t.fat_g, "c": t.carbs_g}})
     await message.answer(
-        "Профиль готов. Работаем по цифрам.\n\n"
-        f"Поддержание (TDEE): <b>{meta.tdee_kcal} ккал</b>\n"
-        f"Темп: <b>{_fmt_pct(meta.deficit_pct)}</b> (дефицит {meta.deficit_kcal} ккал/день)\n"
-        f"Твоя норма: <b>{t.calories} ккал</b>\n"
-        f"БЖУ: <b>{t.protein_g}/{t.fat_g}/{t.carbs_g} г</b>",
-        reply_markup=main_menu_kb(),
+        "Профиль готов. Дальше выбираем, как задаём калории:\n\n"
+        f"Расчёт тренера: <b>{t.calories} ккал</b>, БЖУ <b>{t.protein_g}/{t.fat_g}/{t.carbs_g}</b>\n\n"
+        "1) Оставляем расчёт (по цели/темпу)\n"
+        "2) Ты задаёшь калораж/КБЖУ сам (например: 2800 будни / 2700 выходные)\n",
+        reply_markup=targets_mode_kb(),
     )
     return True
 
@@ -2018,6 +2023,88 @@ async def _handle_daily_checkin(message: Message, *, user_repo: UserRepo, user: 
     return True
 
 
+async def _handle_targets_mode(message: Message, *, user_repo: UserRepo, user: Any, db: Any) -> bool:
+    if user.dialog_state not in {"targets_mode", "targets_custom"}:
+        return False
+    t0 = (message.text or "").strip()
+
+    pref_repo = PreferenceRepo(db)
+    prefs = await pref_repo.get_json(user.id)
+    tz = _tz_from_prefs(prefs)
+    today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+
+    if user.dialog_state == "targets_mode":
+        if t0 in {"❌ Отмена", BTN_MENU}:
+            await user_repo.set_dialog(user, state=None, step=None, data=None)
+            await message.answer("Ок.", reply_markup=main_menu_kb())
+            return True
+        if t0 == BTN_TARGETS_AUTO:
+            await user_repo.set_dialog(user, state=None, step=None, data=None)
+            await message.answer("Ок, используем расчёт тренера. Можешь жать 🗓️ Рацион на день.", reply_markup=main_menu_kb())
+            return True
+        if t0 == BTN_TARGETS_CUSTOM:
+            await user_repo.set_dialog(user, state="targets_custom", step=0, data=None)
+            await message.answer(
+                "Ок. Напиши целевые калории (и при желании БЖУ).\n"
+                "Примеры:\n"
+                "- «2800 будни и 2700 выходные»\n"
+                "- «2800 ккал, Б 210 Ж 80 У 300»\n"
+                "Я зафиксирую и буду строить рацион строго под это.",
+                reply_markup=main_menu_kb(),
+            )
+            return True
+
+        await message.answer("Выбери вариант кнопкой ниже.", reply_markup=targets_mode_kb())
+        return True
+
+    # targets_custom: parse via coach memory extractor (targets field)
+    # We reuse AI extractor to keep it flexible, then ensure macros exist deterministically.
+    handled = await _apply_coach_memory_if_needed(message, pref_repo=pref_repo, user=user)
+    if not handled:
+        await message.answer("Не понял. Напиши числами (ккал и/или БЖУ), например: «2800 будни 2700 выходные».")
+        return True
+
+    # Ensure targets exist and compute macros if only calories were provided
+    prefs2 = await pref_repo.get_json(user.id)
+    targ = prefs2.get("targets") if isinstance(prefs2.get("targets"), dict) else {}
+    kcal_today = None
+    if isinstance(targ, dict):
+        wd = today_local.weekday()
+        is_weekday = wd < 5
+        if is_weekday and isinstance(targ.get("calories_weekdays"), (int, float)):
+            kcal_today = int(targ.get("calories_weekdays"))
+        elif (not is_weekday) and isinstance(targ.get("calories_weekends"), (int, float)):
+            kcal_today = int(targ.get("calories_weekends"))
+        elif isinstance(targ.get("calories"), (int, float)):
+            kcal_today = int(targ.get("calories"))
+    if kcal_today is None and user.calories_target is not None:
+        kcal_today = int(user.calories_target)
+
+    if kcal_today is not None and user.weight_kg and user.goal:
+        missing_macros = not (isinstance(targ.get("protein_g"), (int, float)) and isinstance(targ.get("fat_g"), (int, float)) and isinstance(targ.get("carbs_g"), (int, float)))
+        if missing_macros:
+            mt = macros_for_targets(int(kcal_today), weight_kg=float(user.weight_kg), goal=user.goal)  # type: ignore[arg-type]
+            await pref_repo.merge(
+                user.id,
+                {
+                    "targets": {
+                        **(targ if isinstance(targ, dict) else {}),
+                        "protein_g": mt.protein_g,
+                        "fat_g": mt.fat_g,
+                        "carbs_g": mt.carbs_g,
+                    }
+                },
+            )
+            user.protein_g_target = mt.protein_g
+            user.fat_g_target = mt.fat_g
+            user.carbs_g_target = mt.carbs_g
+            user.calories_target = int(kcal_today)
+
+    await user_repo.set_dialog(user, state=None, step=None, data=None)
+    await message.answer("Ок, зафиксировал твои цели. Теперь 🗓️ Рацион на день будет под них.", reply_markup=main_menu_kb())
+    return True
+
+
 async def _checkin_loop(bot: Bot) -> None:
     """
     Background loop that periodically asks users for photo/measurements according to preferences.
@@ -2226,11 +2313,16 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             if isinstance(targ.get("calories"), (int, float)):
                 return int(targ.get("calories"))
         return int(user.calories_target) if user.calories_target is not None else None
-
-    target_macros = {
-        "protein_g": int(targ.get("protein_g")) if isinstance(targ, dict) and isinstance(targ.get("protein_g"), (int, float)) else user.protein_g_target,
-        "fat_g": int(targ.get("fat_g")) if isinstance(targ, dict) and isinstance(targ.get("fat_g"), (int, float)) else user.fat_g_target,
-        "carbs_g": int(targ.get("carbs_g")) if isinstance(targ, dict) and isinstance(targ.get("carbs_g"), (int, float)) else user.carbs_g_target,
+    macros_override = (
+        isinstance(targ, dict)
+        and isinstance(targ.get("protein_g"), (int, float))
+        and isinstance(targ.get("fat_g"), (int, float))
+        and isinstance(targ.get("carbs_g"), (int, float))
+    )
+    base_macros = {
+        "protein_g": int(targ.get("protein_g")) if macros_override else user.protein_g_target,
+        "fat_g": int(targ.get("fat_g")) if macros_override else user.fat_g_target,
+        "carbs_g": int(targ.get("carbs_g")) if macros_override else user.carbs_g_target,
     }
 
     def _plan_quality_ok(plan: dict[str, Any], kcal_target: int) -> bool:
@@ -2262,11 +2354,14 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             kcal_target = _get_day_kcal(d)
             if kcal_target is None:
                 raise RuntimeError("Нет целевой нормы калорий в профиле.")
-            macro_line = (
-                f"Целевые БЖУ: Б {target_macros.get('protein_g')} / Ж {target_macros.get('fat_g')} / У {target_macros.get('carbs_g')} г.\n"
-                if any(target_macros.values())
-                else ""
-            )
+            if macros_override:
+                macro_line = f"Целевые БЖУ: Б {base_macros.get('protein_g')} / Ж {base_macros.get('fat_g')} / У {base_macros.get('carbs_g')} г.\n"
+            else:
+                try:
+                    mt = macros_for_targets(int(kcal_target), weight_kg=float(user.weight_kg or 0), goal=user.goal or "maintain")  # type: ignore[arg-type]
+                    macro_line = f"Целевые БЖУ: Б {mt.protein_g} / Ж {mt.fat_g} / У {mt.carbs_g} г.\n"
+                except Exception:
+                    macro_line = ""
             # retry once if model doesn't match targets or misses products/shopping list
             last_plan: dict[str, Any] | None = None
             for attempt in range(2):
@@ -2568,6 +2663,11 @@ async def any_text(message: Message) -> None:
         food_repo = FoodRepo(db)
         food_service = FoodService(food_repo)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
+
+        handled = await _handle_targets_mode(message, user_repo=user_repo, user=user, db=db)
+        if handled:
+            await db.commit()
+            return
 
         handled = await _handle_daily_checkin(message, user_repo=user_repo, user=user, db=db)
         if handled:
