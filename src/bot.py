@@ -142,6 +142,50 @@ def _sanitize_ai_text(s: str) -> str:
     return t
 
 
+def _active_targets(
+    *,
+    prefs: dict[str, Any],
+    user: Any,
+    date_local: dt.date,
+) -> dict[str, Any]:
+    """
+    Resolve "active targets" for a given local date from preferences.targets.
+    Returns dict: kcal, protein_g, fat_g, carbs_g, source, store
+    """
+    targ = prefs.get("targets") if isinstance(prefs.get("targets"), dict) else {}
+    source = str(prefs.get("targets_source") or "").strip().lower() or "coach"
+
+    def _k(d: dt.date) -> int | None:
+        if isinstance(targ, dict):
+            wd = d.weekday()
+            is_weekday = wd < 5
+            if is_weekday and isinstance(targ.get("calories_weekdays"), (int, float)):
+                return int(targ.get("calories_weekdays"))
+            if (not is_weekday) and isinstance(targ.get("calories_weekends"), (int, float)):
+                return int(targ.get("calories_weekends"))
+            if isinstance(targ.get("calories"), (int, float)):
+                return int(targ.get("calories"))
+        return int(user.calories_target) if user.calories_target is not None else None
+
+    kcal = _k(date_local)
+    p = int(targ.get("protein_g")) if isinstance(targ, dict) and isinstance(targ.get("protein_g"), (int, float)) else (user.protein_g_target)
+    f = int(targ.get("fat_g")) if isinstance(targ, dict) and isinstance(targ.get("fat_g"), (int, float)) else (user.fat_g_target)
+    c = int(targ.get("carbs_g")) if isinstance(targ, dict) and isinstance(targ.get("carbs_g"), (int, float)) else (user.carbs_g_target)
+
+    # If macros missing but kcal present -> compute deterministic macros
+    if kcal is not None and (p is None or f is None or c is None) and user.weight_kg and user.goal:
+        try:
+            mt = macros_for_targets(int(kcal), weight_kg=float(user.weight_kg), goal=user.goal)  # type: ignore[arg-type]
+            p = mt.protein_g
+            f = mt.fat_g
+            c = mt.carbs_g
+        except Exception:
+            pass
+
+    store = str(prefs.get("preferred_store") or "any")
+    return {"kcal": kcal, "protein_g": p, "fat_g": f, "carbs_g": c, "source": source, "store": store}
+
+
 def _parse_int(s: str) -> int | None:
     s = _norm_text(s)
     m = re.search(r"(\d+)", s)
@@ -289,8 +333,12 @@ async def cmd_profile(message: Message) -> None:
             return
 
         prefs = await pref_repo.get_json(user.id)
+        tz = _tz_from_prefs(prefs)
+        today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+        active = _active_targets(prefs=prefs, user=user, date_local=today_local)
+
         deficit_pct = prefs.get("deficit_pct")
-        t, meta = compute_targets_with_meta(
+        coach_t, meta = compute_targets_with_meta(
             sex=user.sex,  # type: ignore[arg-type]
             age=user.age,
             height_cm=user.height_cm,
@@ -301,18 +349,23 @@ async def cmd_profile(message: Message) -> None:
         )
 
         await message.answer(
-            "Твой профиль:\n"
-            f"- Возраст: {user.age}\n"
-            f"- Пол: {user.sex}\n"
-            f"- Рост: {user.height_cm} см\n"
-            f"- Вес: {user.weight_kg} кг\n"
-            f"- Активность: {user.activity_level}\n"
-            f"- Цель: {_fmt_goal(user.goal)}\n"
-            f"- Поддержание (TDEE): {meta.tdee_kcal} ккал\n"
-            f"- Дефицит: {meta.deficit_kcal} ккал/день ({_fmt_pct(meta.deficit_pct)})\n"
-            f"- Норма: {t.calories} ккал\n"
-            f"- БЖУ: {t.protein_g}/{t.fat_g}/{t.carbs_g} г"
-            ,
+            "👤 <b>Твой профиль</b> 📋\n"
+            f"🎂 Возраст: <b>{user.age}</b>\n"
+            f"🚻 Пол: <b>{user.sex}</b>\n"
+            f"📏 Рост: <b>{user.height_cm} см</b>\n"
+            f"⚖️ Вес: <b>{user.weight_kg} кг</b>\n"
+            f"🏃 Активность: <b>{user.activity_level}</b>\n"
+            f"🎯 Цель: <b>{_fmt_goal(user.goal)}</b>\n\n"
+            "🎯 <b>Активные цели (как договорились)</b>\n"
+            f"🔥 Калории: <b>{active.get('kcal')}</b> ккал\n"
+            f"🥩🧈🍚 БЖУ: <b>{active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')} г</b>\n"
+            f"🧠 Источник: <b>{'custom' if active.get('source')=='custom' else 'coach'}</b>\n"
+            f"🛒 Магазин: <b>{active.get('store')}</b>\n\n"
+            "🧮 <b>Расчёт тренера (справочно)</b>\n"
+            f"⚡ TDEE: <b>{meta.tdee_kcal} ккал</b>\n"
+            f"📉 Дефицит: <b>{meta.deficit_kcal} ккал/день</b> ({_fmt_pct(meta.deficit_pct)})\n"
+            f"🎯 Норма тренера: <b>{coach_t.calories} ккал</b>\n"
+            f"🥩🧈🍚 БЖУ тренера: <b>{coach_t.protein_g}/{coach_t.fat_g}/{coach_t.carbs_g} г</b>",
             reply_markup=main_menu_kb(),
         )
 
@@ -364,10 +417,30 @@ async def cmd_weight(message: Message) -> None:
             goal=user.goal,  # type: ignore[arg-type]
             deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
         )
-        user.calories_target = t.calories
-        user.protein_g_target = t.protein_g
-        user.fat_g_target = t.fat_g
-        user.carbs_g_target = t.carbs_g
+        # Update meta always, but do NOT overwrite custom targets
+        targets_source = str(prefs.get("targets_source") or "coach").strip().lower()
+        if targets_source != "custom":
+            user.calories_target = t.calories
+            user.protein_g_target = t.protein_g
+            user.fat_g_target = t.fat_g
+            user.carbs_g_target = t.carbs_g
+            await pref_repo.merge(
+                user.id,
+                {"targets_source": "coach", "targets": {"calories": t.calories, "protein_g": t.protein_g, "fat_g": t.fat_g, "carbs_g": t.carbs_g}},
+            )
+        else:
+            # keep active custom targets mirrored into user table for /profile consistency
+            tz = _tz_from_prefs(prefs)
+            today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+            active = _active_targets(prefs=prefs, user=user, date_local=today_local)
+            if active.get("kcal") is not None:
+                user.calories_target = int(active["kcal"])
+            if active.get("protein_g") is not None:
+                user.protein_g_target = int(active["protein_g"])
+            if active.get("fat_g") is not None:
+                user.fat_g_target = int(active["fat_g"])
+            if active.get("carbs_g") is not None:
+                user.carbs_g_target = int(active["carbs_g"])
         await pref_repo.merge(
             user.id,
             {"bmr_kcal": meta.bmr_kcal, "tdee_kcal": meta.tdee_kcal, "deficit_pct": meta.deficit_pct},
@@ -375,10 +448,11 @@ async def cmd_weight(message: Message) -> None:
         await db.commit()
 
     await message.answer(
-        f"Обновил вес: <b>{w} кг</b>.\n"
-        f"Поддержание (TDEE): <b>{meta.tdee_kcal} ккал</b>\n"
-        f"Дефицит: <b>{meta.deficit_kcal} ккал/день</b> ({_fmt_pct(meta.deficit_pct)})\n"
-        f"Целевая норма: <b>{t.calories} ккал</b>, БЖУ: <b>{t.protein_g}/{t.fat_g}/{t.carbs_g} г</b>"
+        f"⚖️ Вес обновил: <b>{w} кг</b> ✅\n\n"
+        f"⚡ TDEE: <b>{meta.tdee_kcal} ккал</b>\n"
+        f"📉 Дефицит: <b>{meta.deficit_kcal} ккал/день</b> ({_fmt_pct(meta.deficit_pct)})\n"
+        f"🎯 Текущая цель: <b>{user.calories_target} ккал</b>\n"
+        f"🥩🧈🍚 БЖУ: <b>{user.protein_g_target}/{user.fat_g_target}/{user.carbs_g_target} г</b>"
         ,
         reply_markup=main_menu_kb(),
     )
@@ -804,6 +878,7 @@ async def _handle_coach_onboarding(message: Message, user_repo: UserRepo, user: 
             "tdee_kcal": meta.tdee_kcal,
             # default targets from coach calculation (can be overridden by custom targets later)
             "targets": {"calories": t.calories, "protein_g": t.protein_g, "fat_g": t.fat_g, "carbs_g": t.carbs_g},
+            "targets_source": "coach",
         },
     )
     # durable coach memory
@@ -2094,8 +2169,13 @@ async def _handle_targets_mode(message: Message, *, user_repo: UserRepo, user: A
             await message.answer("Ок.", reply_markup=main_menu_kb())
             return True
         if t0 == BTN_TARGETS_AUTO:
+            try:
+                # mark as coach-driven targets
+                await pref_repo.merge(user.id, {"targets_source": "coach"})
+            except Exception:
+                pass
             await user_repo.set_dialog(user, state=None, step=None, data=None)
-            await message.answer("Ок, используем расчёт тренера. Можешь жать 🗓️ Рацион на день.", reply_markup=main_menu_kb())
+            await message.answer("✅ Ок! Работаем по расчёту тренера 💪📊\n\nЖми 🗓️ Рацион на день 🍽️", reply_markup=main_menu_kb())
             return True
         if t0 == BTN_TARGETS_CUSTOM:
             await user_repo.set_dialog(user, state="targets_custom", step=0, data=None)
@@ -2118,6 +2198,12 @@ async def _handle_targets_mode(message: Message, *, user_repo: UserRepo, user: A
     if not handled:
         await message.answer("Не понял. Напиши числами (ккал и/или БЖУ), например: «2800 будни 2700 выходные».")
         return True
+
+    # mark as custom targets
+    try:
+        await pref_repo.merge(user.id, {"targets_source": "custom"})
+    except Exception:
+        pass
 
     # Ensure targets exist and compute macros if only calories were provided
     prefs2 = await pref_repo.get_json(user.id)
@@ -2156,7 +2242,7 @@ async def _handle_targets_mode(message: Message, *, user_repo: UserRepo, user: A
             user.calories_target = int(kcal_today)
 
     await user_repo.set_dialog(user, state=None, step=None, data=None)
-    await message.answer("Ок, зафиксировал твои цели. Теперь 🗓️ Рацион на день будет под них.", reply_markup=main_menu_kb())
+    await message.answer("✅ Зафиксировал цели 🔥🎯\n\nТеперь 🗓️ Рацион на день 🍽️ будет <b>строго под них</b> 💪", reply_markup=main_menu_kb())
     return True
 
 
@@ -2935,18 +3021,43 @@ async def any_text(message: Message) -> None:
                 await wrepo.upsert(user_id=user.id, date=today_local, weight_kg=float(w))
             except Exception:
                 pass
-            tr = compute_targets(
+            # recompute meta always, but do not overwrite custom targets
+            pref_repo = PreferenceRepo(db)
+            prefs = await pref_repo.get_json(user.id)
+            deficit_pct = prefs.get("deficit_pct")
+            tr, meta = compute_targets_with_meta(
                 sex=user.sex,  # type: ignore[arg-type]
                 age=user.age,
                 height_cm=user.height_cm,
                 weight_kg=user.weight_kg,
                 activity=user.activity_level,  # type: ignore[arg-type]
                 goal=user.goal,  # type: ignore[arg-type]
+                deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
             )
-            user.calories_target = tr.calories
-            user.protein_g_target = tr.protein_g
-            user.fat_g_target = tr.fat_g
-            user.carbs_g_target = tr.carbs_g
+            targets_source = str(prefs.get("targets_source") or "coach").strip().lower()
+            if targets_source != "custom":
+                user.calories_target = tr.calories
+                user.protein_g_target = tr.protein_g
+                user.fat_g_target = tr.fat_g
+                user.carbs_g_target = tr.carbs_g
+                await pref_repo.merge(
+                    user.id,
+                    {"targets_source": "coach", "targets": {"calories": tr.calories, "protein_g": tr.protein_g, "fat_g": tr.fat_g, "carbs_g": tr.carbs_g}},
+                )
+            else:
+                tz = _tz_from_prefs(prefs)
+                today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+                active = _active_targets(prefs=prefs, user=user, date_local=today_local)
+                if active.get("kcal") is not None:
+                    user.calories_target = int(active["kcal"])
+                if active.get("protein_g") is not None:
+                    user.protein_g_target = int(active["protein_g"])
+                if active.get("fat_g") is not None:
+                    user.fat_g_target = int(active["fat_g"])
+                if active.get("carbs_g") is not None:
+                    user.carbs_g_target = int(active["carbs_g"])
+
+            await pref_repo.merge(user.id, {"bmr_kcal": meta.bmr_kcal, "tdee_kcal": meta.tdee_kcal, "deficit_pct": meta.deficit_pct})
             await user_repo.set_dialog(user, state=None, step=None, data=None)
             try:
                 note_repo = CoachNoteRepo(db)
@@ -2954,14 +3065,15 @@ async def any_text(message: Message) -> None:
                     user_id=user.id,
                     kind="weight_update",
                     title="Обновление веса",
-                    note_json={"weight_kg": float(w), "calories_target": user.calories_target, "macros": {"p": tr.protein_g, "f": tr.fat_g, "c": tr.carbs_g}},
+                    note_json={"weight_kg": float(w), "calories_target": user.calories_target, "macros": {"p": user.protein_g_target, "f": user.fat_g_target, "c": user.carbs_g_target}},
                 )
             except Exception:
                 pass
             await db.commit()
             await message.answer(
-                f"Обновил вес: <b>{w} кг</b>.\n"
-                f"Новая норма: <b>{tr.calories} ккал</b>, БЖУ: <b>{tr.protein_g}/{tr.fat_g}/{tr.carbs_g} г</b>",
+                f"⚖️ Вес обновил: <b>{w} кг</b> ✅\n"
+                f"🎯 Текущая цель: <b>{user.calories_target} ккал</b>\n"
+                f"🥩🧈🍚 БЖУ: <b>{user.protein_g_target}/{user.fat_g_target}/{user.carbs_g_target} г</b>",
                 reply_markup=main_menu_kb(),
             )
             return
@@ -3115,25 +3227,49 @@ async def any_text(message: Message) -> None:
                 await wrepo.upsert(user_id=user.id, date=today_local, weight_kg=float(w))
             except Exception:
                 pass
-            t = compute_targets(
+            pref_repo = PreferenceRepo(db)
+            prefs = await pref_repo.get_json(user.id)
+            deficit_pct = prefs.get("deficit_pct")
+            t, meta = compute_targets_with_meta(
                 sex=user.sex,  # type: ignore[arg-type]
                 age=user.age,
                 height_cm=user.height_cm,
                 weight_kg=user.weight_kg,
                 activity=user.activity_level,  # type: ignore[arg-type]
                 goal=user.goal,  # type: ignore[arg-type]
+                deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
             )
-            user.calories_target = t.calories
-            user.protein_g_target = t.protein_g
-            user.fat_g_target = t.fat_g
-            user.carbs_g_target = t.carbs_g
+            targets_source = str(prefs.get("targets_source") or "coach").strip().lower()
+            if targets_source != "custom":
+                user.calories_target = t.calories
+                user.protein_g_target = t.protein_g
+                user.fat_g_target = t.fat_g
+                user.carbs_g_target = t.carbs_g
+                await pref_repo.merge(
+                    user.id,
+                    {"targets_source": "coach", "targets": {"calories": t.calories, "protein_g": t.protein_g, "fat_g": t.fat_g, "carbs_g": t.carbs_g}},
+                )
+            else:
+                tz = _tz_from_prefs(prefs)
+                today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+                active = _active_targets(prefs=prefs, user=user, date_local=today_local)
+                if active.get("kcal") is not None:
+                    user.calories_target = int(active["kcal"])
+                if active.get("protein_g") is not None:
+                    user.protein_g_target = int(active["protein_g"])
+                if active.get("fat_g") is not None:
+                    user.fat_g_target = int(active["fat_g"])
+                if active.get("carbs_g") is not None:
+                    user.carbs_g_target = int(active["carbs_g"])
+
+            await pref_repo.merge(user.id, {"bmr_kcal": meta.bmr_kcal, "tdee_kcal": meta.tdee_kcal, "deficit_pct": meta.deficit_pct})
             try:
                 note_repo = CoachNoteRepo(db)
                 await note_repo.add_note(
                     user_id=user.id,
                     kind="weight_update",
                     title="Обновление веса",
-                    note_json={"weight_kg": float(w), "calories_target": user.calories_target, "macros": {"p": t.protein_g, "f": t.fat_g, "c": t.carbs_g}},
+                    note_json={"weight_kg": float(w), "calories_target": user.calories_target, "macros": {"p": user.protein_g_target, "f": user.fat_g_target, "c": user.carbs_g_target}},
                 )
             except Exception:
                 pass
