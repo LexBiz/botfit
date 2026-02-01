@@ -88,24 +88,30 @@ class FoodService:
         - off_url: openfoodfacts product page (if barcode known)
         - store_url: store-specific search link (always)
         """
+        # prefer a candidate that has BOTH barcode and image (more likely "exact photo")
         cands = await self.search(query)
-        img_url: str | None = None
-        off_url: str | None = None
-        barcode: str | None = None
-        best_name: str | None = None
+        best: FoodCandidate | None = None
+        best_score = -1
         for c in cands:
-            if img_url is None and c.image_url:
-                img_url = c.image_url
-            if barcode is None and c.barcode:
-                barcode = c.barcode
-            if best_name is None and c.name:
-                best_name = c.name
-            if off_url is None and c.barcode:
-                # concrete product page on OFF
-                base = "https://world.openfoodfacts.org"
-                off_url = f"{base}/product/{c.barcode}"
-            if img_url and off_url:
-                break
+            score = 0
+            if c.image_url:
+                score += 3
+            if c.barcode:
+                score += 2
+            if c.brand:
+                score += 1
+            if len(c.name or "") >= 6:
+                score += 1
+            if score > best_score:
+                best_score = score
+                best = c
+
+        img_url: str | None = best.image_url if best and best.image_url else None
+        barcode: str | None = best.barcode if best and best.barcode else None
+        off_url: str | None = None
+        if barcode:
+            off_url = f"https://world.openfoodfacts.org/product/{barcode}"
+        best_name: str | None = best.name if best and best.name else None
         search_query = barcode or best_name or query
         return {
             "img_url": img_url,
@@ -148,7 +154,8 @@ def make_store_search_url(store: str, query: str) -> str:
     s = (store or "").strip().lower()
     # NOTE: Store sites change often; keep simple + safe fallbacks.
     if "kaufl" in s:
-        return f"https://www.kaufland.cz/hledat.html?search_value={q}"
+        # Czech "in-store offer" catalog with product cards/photos
+        return "https://prodejny.kaufland.cz/"
     if "albert" in s:
         return f"https://www.albert.cz/vyhledavani?q={q}"
     if "penny" in s or "peni" in s:

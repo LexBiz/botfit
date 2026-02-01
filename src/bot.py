@@ -2626,6 +2626,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
         img_url = assets.get("img_url")
         off_url = assets.get("off_url")
         store_url = assets.get("store_url") or make_store_search_url(store, display_name)
+        search_query = assets.get("search_query")
         # If display_name is Cyrillic and we have a better non-cyrillic search_query, prefer it for store URL
         if _has_cyrillic_text(display_name):
             sq = assets.get("search_query")
@@ -2639,9 +2640,14 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             links.append(f"<a href=\"{store_url}\">🛒 {store}</a>")
         if isinstance(off_url, str) and off_url:
             links.append(f"<a href=\"{off_url}\">🔎 OFF</a>")
+        q_hint = ""
+        if isinstance(search_query, str) and search_query and (store or "").lower().startswith("kaufl"):
+            # Kaufland catalog may not support deep-link search reliably; give exact query to paste.
+            q_hint = f" 🔎 запрос: <code>{search_query}</code>"
         shopping_lines.append(
             f"- <b>{display_name}</b> — {grams:.0f} г ({store}). {buy_hint}. "
             + " | ".join(links)
+            + q_hint
         )
 
     parts: list[str] = [f"🍽️ <b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>"]
