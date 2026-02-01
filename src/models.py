@@ -126,6 +126,21 @@ class Plan(Base):
     plan_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class CoachNote(Base):
+    __tablename__ = "coach_notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), index=True)
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.now(dt.timezone.utc).replace(tzinfo=None))
+
+    kind: Mapped[str] = mapped_column(String(32), default="note")  # profile_set/weekly_review/prefs_update/weight_update/goal_change/...
+    title: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    note_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    note_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class Food(Base):
     """
     Cache of products from external food databases (e.g. OpenFoodFacts).
@@ -154,4 +169,5 @@ class Food(Base):
 
 Index("ix_meals_user_created", Meal.user_id, Meal.created_at)
 Index("ix_foods_source_barcode", Food.source, Food.barcode)
+Index("ix_coach_notes_user_created", CoachNote.user_id, CoachNote.created_at)
 

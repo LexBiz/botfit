@@ -54,7 +54,7 @@ from src.keyboards import (
 )
 from src.render import recipe_table
 from src.recipe_calc import compute_totals, parse_ingredients_block
-from src.repositories import FoodRepo, MealRepo, PlanRepo, PreferenceRepo, StatRepo, UserRepo
+from src.repositories import CoachNoteRepo, FoodRepo, MealRepo, PlanRepo, PreferenceRepo, StatRepo, UserRepo
 from src.tg_files import download_telegram_file
 from src.models import User
 
@@ -537,6 +537,24 @@ async def _handle_onboarding_step(message: Message, user_repo: UserRepo, user: A
                 "tdee_kcal": meta.tdee_kcal,
             },
         )
+        # durable coach memory
+        try:
+            note_repo = CoachNoteRepo(user_repo.db)
+            await note_repo.add_note(
+                user_id=user.id,
+                kind="profile_set",
+                title="Профиль создан",
+                note_json={
+                    "goal": user.goal,
+                    "tempo_key": tempo_key,
+                    "goal_raw": goal_raw,
+                    "tdee_kcal": meta.tdee_kcal,
+                    "calories_target": t.calories,
+                    "macros": {"p": t.protein_g, "f": t.fat_g, "c": t.carbs_g},
+                },
+            )
+        except Exception:
+            pass
 
         await user_repo.set_dialog(user, state=None, step=None, data=None)
 
@@ -714,6 +732,24 @@ async def _handle_coach_onboarding(message: Message, user_repo: UserRepo, user: 
             "tdee_kcal": meta.tdee_kcal,
         },
     )
+    # durable coach memory
+    try:
+        note_repo = CoachNoteRepo(user_repo.db)
+        await note_repo.add_note(
+            user_id=user.id,
+            kind="profile_set",
+            title="Профиль создан",
+            note_json={
+                "goal": user.goal,
+                "tempo_key": prof.get("tempo_key"),
+                "tdee_kcal": meta.tdee_kcal,
+                "calories_target": t.calories,
+                "macros": {"p": t.protein_g, "f": t.fat_g, "c": t.carbs_g},
+                "prefs_patch": pref_local,
+            },
+        )
+    except Exception:
+        pass
 
     await user_repo.set_dialog(user, state=None, step=None, data=None)
     await message.answer(
@@ -1417,6 +1453,17 @@ async def _apply_coach_memory_if_needed(message: Message, *, pref_repo: Preferen
         return False
 
     await pref_repo.merge(user.id, merged_patch)
+    # store durable memory item
+    try:
+        note_repo = CoachNoteRepo(pref_repo.db)
+        await note_repo.add_note(
+            user_id=user.id,
+            kind="prefs_update",
+            title="Обновление правил/настроек",
+            note_json={"patch": merged_patch, "text": (message.text or "").strip()},
+        )
+    except Exception:
+        pass
     ack = extracted.get("ack")
     await message.answer(str(ack or "Ок, сохранил это как правило/настройку."), reply_markup=main_menu_kb())
     return True
@@ -1500,6 +1547,7 @@ async def _handle_coach_chat(
     pref_repo: PreferenceRepo,
     meal_repo: MealRepo,
     plan_repo: PlanRepo,
+    note_repo: CoachNoteRepo,
     user: Any,
 ) -> bool:
     q = (message.text or "").strip()
@@ -1508,6 +1556,7 @@ async def _handle_coach_chat(
 
     prefs = await pref_repo.get_json(user.id)
     today_plan = await plan_repo.get_day_plan_json(user.id, dt.date.today())
+    recent_notes = await note_repo.last_notes(user.id, limit=20)
     last_meals = await meal_repo.last_meals(user.id, limit=12)
     meals_json = [
         {
@@ -1553,6 +1602,7 @@ async def _handle_coach_chat(
         "preferences": prefs,
         "today_plan": today_plan,
         "recent_meals": meals_json,
+        "coach_notes": recent_notes,
     }
 
     ans = await text_output(
@@ -1885,6 +1935,8 @@ async def cmd_week(message: Message) -> None:
     async with SessionLocal() as db:
         user_repo = UserRepo(db)
         meal_repo = MealRepo(db)
+        stat_repo = StatRepo(db)
+        note_repo = CoachNoteRepo(db)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
         if not user.profile_complete:
             await message.answer("Сначала заполним профиль: /start")
@@ -1936,6 +1988,17 @@ async def cmd_week(message: Message) -> None:
         if ca:
             parts.append(f"\n<b>Корректировка калорий</b>: {ca.get('new_calories')} ккал — {ca.get('reason')}")
         await message.answer("\n".join([p for p in parts if p.strip()]))
+
+        # durable coach memory
+        try:
+            await note_repo.add_note(
+                user_id=user.id,
+                kind="weekly_review",
+                title="Недельный разбор",
+                note_json={"analysis": analysis},
+            )
+        except Exception:
+            pass
 
         # persist weekly snapshot into stats
         avg_cal = int(round(sum(cals) / len(cals))) if cals else None
@@ -2082,6 +2145,16 @@ async def any_text(message: Message) -> None:
             user.fat_g_target = tr.fat_g
             user.carbs_g_target = tr.carbs_g
             await user_repo.set_dialog(user, state=None, step=None, data=None)
+            try:
+                note_repo = CoachNoteRepo(db)
+                await note_repo.add_note(
+                    user_id=user.id,
+                    kind="weight_update",
+                    title="Обновление веса",
+                    note_json={"weight_kg": float(w), "calories_target": user.calories_target, "macros": {"p": tr.protein_g, "f": tr.fat_g, "c": tr.carbs_g}},
+                )
+            except Exception:
+                pass
             await db.commit()
             await message.answer(
                 f"Обновил вес: <b>{w} кг</b>.\n"
@@ -2127,6 +2200,16 @@ async def any_text(message: Message) -> None:
             user.protein_g_target = t.protein_g
             user.fat_g_target = t.fat_g
             user.carbs_g_target = t.carbs_g
+            try:
+                note_repo = CoachNoteRepo(db)
+                await note_repo.add_note(
+                    user_id=user.id,
+                    kind="weight_update",
+                    title="Обновление веса",
+                    note_json={"weight_kg": float(w), "calories_target": user.calories_target, "macros": {"p": t.protein_g, "f": t.fat_g, "c": t.carbs_g}},
+                )
+            except Exception:
+                pass
             await db.commit()
             await message.answer(
                 f"Обновил вес: <b>{w} кг</b>.\n"
@@ -2155,7 +2238,8 @@ async def any_text(message: Message) -> None:
         if action == "coach_chat":
             pref_repo = PreferenceRepo(db)
             plan_repo = PlanRepo(db)
-            handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, user=user)
+            note_repo = CoachNoteRepo(db)
+            handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, note_repo=note_repo, user=user)
             if handled:
                 await db.commit()
                 return
@@ -2173,7 +2257,8 @@ async def any_text(message: Message) -> None:
         if not _looks_like_meal(user_text):
             pref_repo = PreferenceRepo(db)
             plan_repo = PlanRepo(db)
-            handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, user=user)
+            note_repo = CoachNoteRepo(db)
+            handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, note_repo=note_repo, user=user)
             if handled:
                 await db.commit()
                 return

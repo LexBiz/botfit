@@ -7,7 +7,7 @@ from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.jsonutil import dumps, loads
-from src.models import Food, Meal, Plan, Preference, Stat, User
+from src.models import CoachNote, Food, Meal, Plan, Preference, Stat, User
 
 
 class UserRepo:
@@ -151,6 +151,48 @@ class PlanRepo:
             return None
         obj = loads(p.plan_json)
         return obj if isinstance(obj, dict) else None
+
+
+class CoachNoteRepo:
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def add_note(
+        self,
+        *,
+        user_id: int,
+        kind: str,
+        title: str | None = None,
+        note_json: dict[str, Any] | None = None,
+        note_text: str | None = None,
+    ) -> CoachNote:
+        n = CoachNote(
+            user_id=user_id,
+            kind=kind,
+            title=title,
+            note_json=dumps(note_json) if note_json is not None else None,
+            note_text=note_text,
+        )
+        self.db.add(n)
+        await self.db.flush()
+        return n
+
+    async def last_notes(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        q = select(CoachNote).where(CoachNote.user_id == user_id).order_by(CoachNote.created_at.desc()).limit(limit)
+        res = await self.db.execute(q)
+        out: list[dict[str, Any]] = []
+        for n in res.scalars().all():
+            obj = loads(n.note_json) if n.note_json else None
+            out.append(
+                {
+                    "created_at": n.created_at.isoformat(),
+                    "kind": n.kind,
+                    "title": n.title,
+                    "note_json": obj if isinstance(obj, (dict, list)) else None,
+                    "note_text": n.note_text,
+                }
+            )
+        return out
 
 
 class StatRepo:
