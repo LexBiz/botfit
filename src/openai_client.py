@@ -258,6 +258,23 @@ async def text_json(
             obj2 = _try_parse_json(text2)
             if obj2 is not None:
                 return obj2
+            # Last resort: fall back to Chat Completions JSON mode (often more stable than Responses output_text).
+            try:
+                text3 = await _chat_create(
+                    model=m,
+                    messages=[
+                        {"role": "system", "content": system + _strict_json_suffix()},
+                        {"role": "user", "content": user},
+                    ],
+                    max_output_tokens=max_output_tokens,
+                    response_format={"type": "json_object"},
+                    timeout_s=timeout_s,
+                )
+                obj3 = _try_parse_json(text3)
+                if obj3 is not None:
+                    return obj3
+            except Exception:
+                pass
             raise ValueError(f"Model did not return JSON after retry. Got: {text2[:500] or '<empty>'}")
         else:
             retry_messages = [
