@@ -13,9 +13,19 @@ BTN_REMINDERS = "⏰ Напоминания"
 BTN_PROGRESS = "📷📏 Прогресс"
 BTN_HELP = "❓ Помощь"
 BTN_MENU = "🏠 Меню"
+BTN_CANCEL = "❌ Отмена"
 
 BTN_TARGETS_AUTO = "✅ Использовать расчёт тренера"
 BTN_TARGETS_CUSTOM = "✍️ Я задам калории/КБЖУ сам"
+
+BTN_PLAN_TODAY = "📅 Сегодня"
+BTN_PLAN_TOMORROW = "➡️ Завтра"
+BTN_PLAN_AFTER_TOMORROW = "⏭️ Послезавтра"
+BTN_PLAN_OTHER_DATE = "🗓️ Другая дата"
+
+BTN_DAYS_1 = "1 день"
+BTN_DAYS_3 = "3 дня"
+BTN_DAYS_7 = "7 дней"
 
 
 MAIN_BUTTONS: list[list[str]] = [
@@ -78,5 +88,32 @@ def targets_mode_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         one_time_keyboard=True,
         input_field_placeholder="Как задаём калории?",
+    )
+
+
+def plan_when_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_PLAN_TODAY, BTN_PLAN_TOMORROW],
+        [BTN_PLAN_AFTER_TOMORROW, BTN_PLAN_OTHER_DATE],
+        [BTN_CANCEL],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="На какой день?",
+    )
+
+
+def plan_days_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_DAYS_1, BTN_DAYS_3, BTN_DAYS_7],
+        [BTN_CANCEL],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="На сколько дней?",
     )
 

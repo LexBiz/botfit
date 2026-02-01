@@ -42,9 +42,17 @@ from src.prompts import (
 )
 from src.food_service import FoodService, compute_item_macros
 from src.keyboards import (
+    BTN_CANCEL,
+    BTN_DAYS_1,
+    BTN_DAYS_3,
+    BTN_DAYS_7,
     BTN_HELP,
     BTN_LOG_MEAL,
     BTN_MENU,
+    BTN_PLAN_AFTER_TOMORROW,
+    BTN_PLAN_OTHER_DATE,
+    BTN_PLAN_TODAY,
+    BTN_PLAN_TOMORROW,
     BTN_PHOTO_HELP,
     BTN_PLAN,
     BTN_PROFILE,
@@ -56,6 +64,8 @@ from src.keyboards import (
     BTN_WEIGHT,
     goal_tempo_kb,
     main_menu_kb,
+    plan_days_kb,
+    plan_when_kb,
     targets_mode_kb,
 )
 from src.render import recipe_table
@@ -99,6 +109,30 @@ ONBOARDING_QUESTIONS = {
 
 def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
+
+
+def _sanitize_ai_text(s: str) -> str:
+    """
+    Telegram is in HTML parse_mode. Models sometimes return Markdown with '*' which looks ugly.
+    Convert common Markdown emphasis to HTML and remove remaining '*'/'_'.
+    """
+    if not s:
+        return s
+    t = s.strip()
+    # convert common markdown emphasis
+    try:
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t, flags=re.S)
+        t = re.sub(r"__(.+?)__", r"<b>\1</b>", t, flags=re.S)
+        # italics: single * or _
+        t = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", t, flags=re.S)
+        t = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"<i>\1</i>", t, flags=re.S)
+    except Exception:
+        pass
+    # normalize bullets a bit
+    t = t.replace("•", "- ")
+    # remove leftover markdown tokens
+    t = t.replace("*", "").replace("_", "")
+    return t
 
 
 def _parse_int(s: str) -> int | None:
@@ -1879,7 +1913,7 @@ async def _handle_coach_chat(
         user="Контекст (из БД):\n" + dumps(ctx) + "\n\nВопрос пользователя:\n" + q,
         max_output_tokens=900,
     )
-    await message.answer(ans[:3900], reply_markup=main_menu_kb())
+    await message.answer(_sanitize_ai_text(ans)[:3900], reply_markup=main_menu_kb())
     return True
 
 
@@ -2290,16 +2324,20 @@ async def cmd_plan(message: Message) -> None:
             if len(parts) >= 2 and parts[1].isdigit():
                 days = max(1, min(int(parts[1]), 7))
 
-        await _generate_plan_for_days(message, db=db, user=user, days=days)
+        # Use user's local date as start
+        pref_repo = PreferenceRepo(db)
+        prefs = await pref_repo.get_json(user.id)
+        tz = _tz_from_prefs(prefs)
+        start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+        await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date)
         return
 
 
-async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int) -> None:
+async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days: int, start_date: dt.date) -> None:
     plan_repo = PlanRepo(db)
     food_service = FoodService(FoodRepo(db))
     pref_repo = PreferenceRepo(db)
     prefs = await pref_repo.get_json(user.id)
-    start_date = dt.date.today()
     # choose target kcal/macros: prefer explicit targets from prefs (incl weekday/weekend)
     targ = prefs.get("targets") if isinstance(prefs.get("targets"), dict) else {}
     def _get_day_kcal(d: dt.date) -> int | None:
@@ -2396,7 +2434,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             user=_profile_context(user) + f"\nНорма: {user.calories_target} ккал. Составь рацион на день.",
             max_output_tokens=1400,
         )
-        await message.answer(plan_text[:3900], reply_markup=main_menu_kb())
+        await message.answer(_sanitize_ai_text(plan_text)[:3900], reply_markup=main_menu_kb())
         return
 
     # persist plans
@@ -2467,7 +2505,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             f"<a href=\"{img_url}\">фото</a>"
         )
 
-    parts: list[str] = [f"<b>Рацион на {days} дн.</b>"]
+    parts: list[str] = [f"<b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>"]
     for di, plan in enumerate(day_plans):
         d = start_date + dt.timedelta(days=di)
         meals = plan.get("meals") or []
@@ -2584,7 +2622,7 @@ async def cmd_week(message: Message) -> None:
                 user=_profile_context(user) + "\nДневник за 7 дней:\n" + dumps(diary),
                 max_output_tokens=1200,
             )
-            await message.answer(txt[:3900], reply_markup=main_menu_kb())
+            await message.answer(_sanitize_ai_text(txt)[:3900], reply_markup=main_menu_kb())
             return
 
         parts = [
@@ -2743,9 +2781,9 @@ async def any_text(message: Message) -> None:
             await cmd_profile(message)
             return
         if t in {BTN_PLAN}:
-            await user_repo.set_dialog(user, state="plan_days", step=0, data=None)
+            await user_repo.set_dialog(user, state="plan_when", step=0, data=None)
             await db.commit()
-            await message.answer("На сколько дней сделать рацион? (1-7). Можно просто цифрой.", reply_markup=main_menu_kb())
+            await message.answer("📅 На какой день сделать рацион?", reply_markup=plan_when_kb())
             return
         if t in {BTN_WEEK}:
             await cmd_week(message)
@@ -2884,16 +2922,93 @@ async def any_text(message: Message) -> None:
             )
             return
 
-        # plan_days dialog
-        if user.dialog_state == "plan_days":
-            n = _parse_int(t)
-            if n is None or not (1 <= n <= 7):
-                await message.answer("Напиши число от 1 до 7.", reply_markup=main_menu_kb())
+        # plan dialogs (date + days)
+        if user.dialog_state in {"plan_when", "plan_date", "plan_days"}:
+            if t in {BTN_CANCEL, "❌ Отмена", BTN_MENU}:
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await message.answer("Ок, отменил.", reply_markup=main_menu_kb())
                 return
-            await user_repo.set_dialog(user, state=None, step=None, data=None)
-            await db.commit()
-            await _generate_plan_for_days(message, db=db, user=user, days=n)
-            return
+
+            pref_repo = PreferenceRepo(db)
+            prefs = await pref_repo.get_json(user.id)
+            tz = _tz_from_prefs(prefs)
+            today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+
+            if user.dialog_state == "plan_when":
+                if t == BTN_PLAN_TODAY:
+                    start_date = today_local
+                elif t == BTN_PLAN_TOMORROW:
+                    start_date = today_local + dt.timedelta(days=1)
+                elif t == BTN_PLAN_AFTER_TOMORROW:
+                    start_date = today_local + dt.timedelta(days=2)
+                elif t == BTN_PLAN_OTHER_DATE:
+                    await user_repo.set_dialog(user, state="plan_date", step=0, data=None)
+                    await db.commit()
+                    await message.answer("Введи дату (DD.MM или YYYY-MM-DD). Например: 03.02 или 2026-02-03.", reply_markup=main_menu_kb())
+                    return
+                else:
+                    await message.answer("Выбери день кнопкой 👇", reply_markup=plan_when_kb())
+                    return
+
+                await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat()})
+                await db.commit()
+                await message.answer(f"Ок. Старт: <b>{start_date.isoformat()}</b>. На сколько дней? (1-7)", reply_markup=plan_days_kb())
+                return
+
+            if user.dialog_state == "plan_date":
+                s0 = _norm_text(t)
+                start_date: dt.date | None = None
+                # YYYY-MM-DD
+                m1 = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s0)
+                if m1:
+                    try:
+                        start_date = dt.date(int(m1.group(1)), int(m1.group(2)), int(m1.group(3)))
+                    except Exception:
+                        start_date = None
+                # DD.MM or DD.MM.YYYY
+                if start_date is None:
+                    m2 = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?$", s0)
+                    if m2:
+                        try:
+                            dd = int(m2.group(1))
+                            mm = int(m2.group(2))
+                            yy = int(m2.group(3)) if m2.group(3) else today_local.year
+                            start_date = dt.date(yy, mm, dd)
+                        except Exception:
+                            start_date = None
+
+                if start_date is None:
+                    await message.answer("Не понял дату. Пример: 03.02 или 2026-02-03.", reply_markup=main_menu_kb())
+                    return
+                if start_date < today_local:
+                    await message.answer(f"Эта дата в прошлом ({start_date.isoformat()}). Введи будущую/сегодня.", reply_markup=main_menu_kb())
+                    return
+
+                await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat()})
+                await db.commit()
+                await message.answer(f"Ок. Старт: <b>{start_date.isoformat()}</b>. На сколько дней? (1-7)", reply_markup=plan_days_kb())
+                return
+
+            if user.dialog_state == "plan_days":
+                n = _parse_int(t)
+                if n is None or not (1 <= n <= 7):
+                    await message.answer("Напиши число от 1 до 7 (или выбери кнопку).", reply_markup=plan_days_kb())
+                    return
+                # pull start_date from dialog data (default: today_local)
+                start_date = today_local
+                try:
+                    data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+                    sd = (data or {}).get("start_date")
+                    if isinstance(sd, str):
+                        start_date = dt.date.fromisoformat(sd)
+                except Exception:
+                    pass
+
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await _generate_plan_for_days(message, db=db, user=user, days=n, start_date=start_date)
+                return
 
         # Agent router (free-form commands)
         user_text = (message.text or "").strip()
