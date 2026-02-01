@@ -2596,6 +2596,9 @@ async def cmd_plan(message: Message) -> None:
         prefs = await pref_repo.get_json(user.id)
         tz = _tz_from_prefs(prefs)
         start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+        await user_repo.set_dialog(user, state="plan_generating", step=0, data={"start_date": start_date.isoformat(), "days": days})
+        await db.commit()
+        await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=main_menu_kb())
         await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date)
         return
 
@@ -2721,6 +2724,15 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             "Или нажми кнопки ниже 👇",
             reply_markup=plan_edit_kb(),
         )
+    except Exception:
+        pass
+
+    # clear generating state if still set
+    try:
+        user_repo = UserRepo(db)
+        if user.dialog_state == "plan_generating":
+            await user_repo.set_dialog(user, state="plan_edit", step=0, data={"start_date": start_date.isoformat(), "days": days})
+            await db.commit()
     except Exception:
         pass
 
@@ -2889,6 +2901,17 @@ async def any_text(message: Message) -> None:
         food_repo = FoodRepo(db)
         food_service = FoodService(food_repo)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
+
+        # If a long-running plan is being generated, keep UX tight.
+        t_now = (message.text or "").strip()
+        if user.dialog_state == "plan_generating":
+            if t_now in {BTN_CANCEL, "❌ Отмена", BTN_MENU}:
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await message.answer("Ок, отменил. 🧠 Если нужно — снова жми 🗓️ Рацион на день.", reply_markup=main_menu_kb())
+                return
+            await message.answer("⏳ Я собираю рацион прямо сейчас…\n\nПодожди 10–40 сек или нажми ❌ Отмена.", reply_markup=main_menu_kb())
+            return
 
         handled = await _handle_targets_mode(message, user_repo=user_repo, user=user, db=db)
         if handled:
@@ -3282,8 +3305,10 @@ async def any_text(message: Message) -> None:
                 except Exception:
                     pass
 
-                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                # mark as generating to prevent "Аууу" / random text from being routed elsewhere
+                await user_repo.set_dialog(user, state="plan_generating", step=0, data={"start_date": start_date.isoformat(), "days": n})
                 await db.commit()
+                await message.answer("⏳ Готовлю рацион… (обычно 10–40 сек) 🍽️", reply_markup=main_menu_kb())
                 await _generate_plan_for_days(message, db=db, user=user, days=n, start_date=start_date)
                 return
 
