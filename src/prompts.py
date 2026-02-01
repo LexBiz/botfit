@@ -177,7 +177,7 @@ ROUTER_JSON = """
 
 Формат:
 {
-  "action": "log_meal" | "plan_day" | "analyze_week" | "update_weight" | "show_profile" | "help" | "unknown",
+  "action": "log_meal" | "plan_day" | "analyze_week" | "update_weight" | "show_profile" | "help" | "update_prefs" | "unknown",
   "meal_text": string | null,
   "weight_kg": number | null,
   "note": string | null
@@ -188,8 +188,37 @@ ROUTER_JSON = """
 - Если пользователь просит составить рацион/меню на день — action="plan_day".
 - Если просит анализ дневника за неделю/7 дней — action="analyze_week".
 - Если сообщает новый вес (например "вес 82.5" / "я вешу 82") — action="update_weight" и weight_kg.
-- Если просит показать профиль — action="show_profile".
+- Если просит показать профиль/данные по мне/мои данные/что ты знаешь про меня — action="show_profile".
 - Если просит помощь/что умеешь/команды — action="help".
+- Если просит «учти/запомни/добавь в привычки/каждый день/по будням/каждые N дней проси фото/замеры/принимаю спортпит»
+  или в целом сообщает предпочтение/правило — action="update_prefs" и note=кратко что изменилось.
 - Если непонятно — action="unknown" и note с уточняющим вопросом (1 вопрос).
+""".strip()
+
+
+COACH_MEMORY_JSON = """
+Верни строго JSON (без текста вокруг). Задача: извлечь из сообщения пользователя новые правила/привычки/предпочтения и патч для БД.
+
+Формат:
+{
+  "preferences_patch": {
+    "snack_rules": [
+      {"days": "weekdays" | "all" | "weekends", "time": "HH:MM", "text": string}
+    ] | null,
+    "supplements": [string, ...] | null,
+    "checkin_every_days": number | null,
+    "checkin_ask": {"photo": boolean, "measurements": boolean} | null,
+    "notes": string | null
+  },
+  "ack": string | null,
+  "should_apply": boolean
+}
+
+Правила:
+- Если сообщение НЕ про сохранение правил/привычек/настроек — should_apply=false.
+- Если пользователь говорит «каждые 3 дня проси фото и замеры» -> checkin_every_days=3, checkin_ask photo=true measurements=true.
+- Если «в 9 утра перекус по будням» -> snack_rules=[{"days":"weekdays","time":"09:00","text":"перекус"}].
+- supplements: если «принимаю спортпит/креатин/протеин» — добавь в список (без дозировок, если их нет).
+- ack: короткое подтверждение, что сохранено (1-2 строки).
 """.strip()
 

@@ -6,6 +6,8 @@ import math
 import re
 from typing import Any
 
+from sqlalchemy import select
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
@@ -22,6 +24,7 @@ from src.audio import ogg_opus_to_wav_bytes
 from src.openai_client import text_json, text_output, transcribe_audio, vision_json
 from src.prompts import (
     COACH_ONBOARD_JSON,
+    COACH_MEMORY_JSON,
     DAY_PLAN_JSON,
     MEAL_ITEMS_JSON,
     MEAL_FROM_PHOTO_FINAL_JSON,
@@ -51,6 +54,7 @@ from src.render import recipe_table
 from src.recipe_calc import compute_totals, parse_ingredients_block
 from src.repositories import FoodRepo, MealRepo, PlanRepo, PreferenceRepo, StatRepo, UserRepo
 from src.tg_files import download_telegram_file
+from src.models import User
 
 
 router = Router()
@@ -1317,12 +1321,115 @@ async def _handle_apply_calories(message: Message, user_repo: UserRepo, user: An
 async def _agent_route(text: str, user: Any) -> dict[str, Any] | None:
     try:
         return await text_json(
-            system=f"{SYSTEM_NUTRITIONIST}\n\n{ROUTER_JSON}",
+            system=f"{SYSTEM_COACH}\n\n{ROUTER_JSON}",
             user=_profile_context(user) + "\nСообщение пользователя:\n" + text,
             max_output_tokens=300,
         )
     except Exception:
         return None
+
+
+def _parse_dt(s: str | None) -> dt.datetime | None:
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        return dt.datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+async def _apply_coach_memory_if_needed(message: Message, *, pref_repo: PreferenceRepo, user: Any) -> bool:
+    """
+    Parse free-form "remember this" / routines / supplements and persist to preferences.
+    Returns True if handled (i.e., saved and user was replied to).
+    """
+    txt = (message.text or "").strip()
+    if not txt:
+        return False
+
+    prefs = await pref_repo.get_json(user.id)
+    extracted = await text_json(
+        system=f"{SYSTEM_COACH}\n\n{COACH_MEMORY_JSON}",
+        user="Текущие предпочтения из БД:\n" + dumps(prefs) + "\nСообщение пользователя:\n" + txt,
+        max_output_tokens=450,
+    )
+    if not isinstance(extracted, dict):
+        return False
+    if not extracted.get("should_apply"):
+        return False
+
+    patch = extracted.get("preferences_patch") or {}
+    if not isinstance(patch, dict) or not patch:
+        return False
+
+    # merge snack_rules/supplements carefully
+    merged_patch: dict[str, Any] = {}
+
+    if isinstance(patch.get("snack_rules"), list):
+        merged_patch["snack_rules"] = patch["snack_rules"]
+    if isinstance(patch.get("supplements"), list):
+        merged_patch["supplements"] = patch["supplements"]
+    if isinstance(patch.get("checkin_every_days"), (int, float)):
+        merged_patch["checkin_every_days"] = int(patch["checkin_every_days"])
+    if isinstance(patch.get("checkin_ask"), dict):
+        merged_patch["checkin_ask"] = patch["checkin_ask"]
+    if isinstance(patch.get("notes"), str) and patch.get("notes"):
+        merged_patch["notes"] = str(patch["notes"]).strip()
+
+    if not merged_patch:
+        return False
+
+    await pref_repo.merge(user.id, merged_patch)
+    ack = extracted.get("ack")
+    await message.answer(str(ack or "Ок, сохранил это как правило/настройку."), reply_markup=main_menu_kb())
+    return True
+
+
+async def _checkin_loop(bot: Bot) -> None:
+    """
+    Background loop that periodically asks users for photo/measurements according to preferences.
+    """
+    while True:
+        try:
+            async with SessionLocal() as db:
+                pref_repo = PreferenceRepo(db)
+                # list users
+                res = await db.execute(select(User).where(User.profile_complete == True))  # noqa: E712
+                users = list(res.scalars().all())
+                now = _utcnow_naive()
+
+                for u in users:
+                    prefs = await pref_repo.get_json(u.id)
+                    every = prefs.get("checkin_every_days")
+                    if not isinstance(every, (int, float)) or every <= 0:
+                        continue
+
+                    last = _parse_dt(prefs.get("last_checkin_request_utc"))
+                    if last and (now - last) < dt.timedelta(days=float(every)):
+                        continue
+
+                    ask = prefs.get("checkin_ask") or {}
+                    want_photo = bool(ask.get("photo", True))
+                    want_meas = bool(ask.get("measurements", True))
+                    parts = ["Проверка прогресса:"]
+                    if want_photo:
+                        parts.append("- пришли фото (фронт/бок/спина) при одинаковом свете")
+                    if want_meas:
+                        parts.append("- и замеры: талия/бедра/грудь (см)")
+                    parts.append("Если хочешь отключить — напиши: «не проси фото/замеры» или «отмени чек-ин».")
+                    text = "\n".join(parts)
+
+                    try:
+                        await bot.send_message(u.telegram_id, text, reply_markup=main_menu_kb())
+                        await pref_repo.merge(u.id, {"last_checkin_request_utc": now.isoformat()})
+                        await db.commit()
+                    except Exception:
+                        # ignore delivery errors (blocked bot etc.)
+                        continue
+        except Exception:
+            pass
+
+        await asyncio.sleep(60 * 30)
 
 
 @router.message(Command("plan"))
@@ -1778,6 +1885,12 @@ async def any_text(message: Message) -> None:
         if action == "analyze_week":
             await cmd_week(message)
             return
+        if action == "update_prefs":
+            pref_repo = PreferenceRepo(db)
+            handled = await _apply_coach_memory_if_needed(message, pref_repo=pref_repo, user=user)
+            if handled:
+                await db.commit()
+                return
         if action == "unknown":
             note = (route or {}).get("note") or "Уточни, что именно сделать?"
             await message.answer(str(note))
@@ -1826,6 +1939,7 @@ async def main() -> None:
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.include_router(router)
+    asyncio.create_task(_checkin_loop(bot))
     await dp.start_polling(bot)
 
 
