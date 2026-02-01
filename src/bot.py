@@ -201,12 +201,18 @@ def _plan_quality_ok(plan: dict[str, Any], kcal_target: int) -> bool:
         meals = plan.get("meals") or []
         if not isinstance(meals, list) or not meals:
             return False
+        # ban supplements / powders unless explicitly requested (common low-quality failure)
+        banned = ["whey", "protein powder", "mass gainer", "gainer", "bca", "bcaa", "creatine", "протеин", "сыворот", "гейнер", "креатин"]
         for m in meals:
             prods = (m or {}).get("products") or []
             if not isinstance(prods, list) or not prods:
                 return False
             for p in prods:
-                if not p or not p.get("name") or float(p.get("grams") or 0) <= 0:
+                name = str((p or {}).get("name") or "").strip()
+                if not name or float((p or {}).get("grams") or 0) <= 0:
+                    return False
+                low = name.lower()
+                if any(b in low for b in banned):
                     return False
         totals = plan.get("totals") or {}
         kcal = totals.get("kcal")
@@ -2698,28 +2704,44 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
             # retry if model doesn't match targets or returns invalid JSON
             last_plan: dict[str, Any] | None = None
             last_err: Exception | None = None
-            for attempt in range(3):
-                extra = "" if attempt == 0 else "\nВАЖНО: прошлый вариант не соответствовал целевым ккал/или не заполнил продукты/граммы. Исправь."
-                store_line = f"\nВАЖНО: покупка только в магазине: <b>{store_only}</b>. Все products[*].store и shopping_list[*].store должны быть строго '{store_only}'." if store_only else ""
+            store_line = (
+                f"\nВАЖНО: покупка только в магазине: <b>{store_only}</b>. Все products[*].store и shopping_list[*].store должны быть строго '{store_only}'."
+                if store_only
+                else ""
+            )
+            user_prompt = (
+                _profile_context(user)
+                + "\nПредпочтения/режим дня (из БД):\n"
+                + dumps(prefs)
+                + f"\nСоставь рацион на {d.isoformat()} на <b>{kcal_target} ккал</b>.\n"
+                + macro_line
+                + store_line
+                + "Требования:\n"
+                + "- Сумма за день должна попасть в цель (допуск ±5%).\n"
+                + "- Продукты реальные и типовые для Чехии (Lidl/Kaufland/Albert/PENNY).\n"
+                + "- В каждом приёме пищи обязателен список продуктов с граммами.\n"
+                + "- shopping_list обязателен.\n"
+                + "- Никаких спорт-добавок (whey/протеин/креатин/гейнер).\n"
+            )
+
+            # Speed + cost: try fast model first, then fallback to high-quality model.
+            models_to_try: list[str] = []
+            m_fast = str(getattr(settings, "openai_plan_model_fast", "") or "").strip()
+            if m_fast:
+                models_to_try.append(m_fast)
+            models_to_try.append(settings.openai_plan_model)
+            models_seen: set[str] = set()
+            for m in models_to_try:
+                if not m or m in models_seen:
+                    continue
+                models_seen.add(m)
                 try:
                     plan = await text_json(
                         system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
-                        user=(
-                            _profile_context(user)
-                            + "\nПредпочтения/режим дня (из БД):\n"
-                            + dumps(prefs)
-                            + f"\nСоставь рацион на {d.isoformat()} на <b>{kcal_target} ккал</b>.\n"
-                            + macro_line
-                            + store_line
-                            + "Требования:\n"
-                            + "- Сумма за день должна попасть в цель (допуск ±5%).\n"
-                            + "- Продукты реальные и типовые для Чехии (Lidl/Kaufland/Albert/PENNY).\n"
-                            + "- В каждом приёме пищи обязателен список продуктов с граммами.\n"
-                            + "- shopping_list обязателен.\n"
-                            + extra
-                        ),
-                        model=settings.openai_plan_model,
-                        max_output_tokens=1600,
+                        user=user_prompt,
+                        model=m,
+                        max_output_tokens=1400,
+                        timeout_s=getattr(settings, "openai_plan_timeout_s", 30),
                     )
                 except Exception as e:
                     last_err = e
@@ -3485,25 +3507,35 @@ async def any_text(message: Message) -> None:
             # Ask model to patch the plan
             last_plan: dict[str, Any] | None = None
             last_err: Exception | None = None
-            for attempt in range(3):
-                extra = "" if attempt == 0 else "\nВАЖНО: прошлый вариант не попал в цели ккал/продукты. Исправь и пересчитай."
+            edit_prompt = (
+                _profile_context(user)
+                + "\nПредпочтения/режим дня (из БД):\n"
+                + dumps(prefs)
+                + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
+                + store_line
+                + f"\nТекущий план на {edit_date.isoformat()}:\n"
+                + dumps(current)
+                + "\n\nПросьба пользователя:\n"
+                + t0
+                + "\nВАЖНО: минимальные изменения, пересчитать граммы/ккал под цель, без спорт-добавок.\n"
+            )
+            models_to_try: list[str] = []
+            m_fast = str(getattr(settings, "openai_plan_model_fast", "") or "").strip()
+            if m_fast:
+                models_to_try.append(m_fast)
+            models_to_try.append(settings.openai_plan_model)
+            models_seen: set[str] = set()
+            for m in models_to_try:
+                if not m or m in models_seen:
+                    continue
+                models_seen.add(m)
                 try:
                     patched = await text_json(
                         system=f"{SYSTEM_COACH}\n\n{PLAN_EDIT_JSON}",
-                        user=(
-                            _profile_context(user)
-                            + "\nПредпочтения/режим дня (из БД):\n"
-                            + dumps(prefs)
-                            + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
-                            + store_line
-                            + f"\nТекущий план на {edit_date.isoformat()}:\n"
-                            + dumps(current)
-                            + "\n\nПросьба пользователя:\n"
-                            + t0
-                            + extra
-                        ),
-                        model=settings.openai_plan_model,
-                        max_output_tokens=1600,
+                        user=edit_prompt,
+                        model=m,
+                        max_output_tokens=1400,
+                        timeout_s=getattr(settings, "openai_plan_timeout_s", 30),
                     )
                 except Exception as e:
                     last_err = e

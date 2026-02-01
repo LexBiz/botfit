@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     openai_transcribe_model: str = Field(default="gpt-4o-mini-transcribe", validation_alias="OPENAI_TRANSCRIBE_MODEL")
     # Model for heavy JSON plans (can be overridden in .env)
     openai_plan_model: str = Field(default="gpt-5.2", validation_alias="OPENAI_PLAN_MODEL")
+    # Fast/cheap primary model for plans; fallback to openai_plan_model if quality/JSON fails
+    openai_plan_model_fast: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_PLAN_MODEL_FAST")
+    # Plan-specific timeout (seconds). Keep lower than global to avoid 2-3 minute waits.
+    openai_plan_timeout_s: int = Field(default=30, validation_alias="OPENAI_PLAN_TIMEOUT_S")
     # Hard timeout for OpenAI requests (seconds) to avoid "hangs"
     openai_timeout_s: int = Field(default=45, validation_alias="OPENAI_TIMEOUT_S")
 

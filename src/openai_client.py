@@ -54,6 +54,7 @@ async def _chat_create(
     messages: list[dict[str, Any]],
     max_output_tokens: int,
     response_format: dict[str, Any] | None,
+    timeout_s: int | None = None,
 ) -> str:
     """
     Best-effort compatibility layer for Chat Completions across model/SDK differences.
@@ -62,7 +63,7 @@ async def _chat_create(
     # We only try max_tokens branch if max_completion_tokens is explicitly unsupported.
     last_err: Exception | None = None
 
-    timeout_s = getattr(settings, "openai_timeout_s", 45)
+    timeout_s = int(timeout_s if timeout_s is not None else getattr(settings, "openai_timeout_s", 45))
 
     # 1) Try max_completion_tokens with/without response_format
     try:
@@ -118,31 +119,79 @@ async def _chat_create(
         raise RuntimeError(f"Chat completion failed. Last error: {last_err}")
 
 
+async def _responses_create_text(
+    *,
+    model: str,
+    system: str,
+    user: str,
+    max_output_tokens: int,
+    timeout_s: int,
+    enforce_json: bool,
+) -> str:
+    """
+    Responses API helper. If enforce_json=True, tries best-effort structured JSON mode.
+    """
+    base_kwargs: dict[str, Any] = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system}]},
+            {"role": "user", "content": [{"type": "input_text", "text": user}]},
+        ],
+        "max_output_tokens": max_output_tokens,
+    }
+
+    last_err: Exception | None = None
+    if enforce_json:
+        # 1) Preferred: text.format json_object (newer SDKs)
+        try:
+            resp = await asyncio.wait_for(
+                client.responses.create(**base_kwargs, text={"format": {"type": "json_object"}}),  # type: ignore[arg-type]
+                timeout=timeout_s,
+            )
+            return (getattr(resp, "output_text", None) or "").strip()
+        except Exception as e:
+            last_err = e
+            # fall through for compatibility attempts
+        # 2) Compatibility: response_format json_object (some SDKs)
+        try:
+            resp = await asyncio.wait_for(
+                client.responses.create(**base_kwargs, response_format={"type": "json_object"}),  # type: ignore[arg-type]
+                timeout=timeout_s,
+            )
+            return (getattr(resp, "output_text", None) or "").strip()
+        except Exception as e:
+            last_err = e
+            # 3) Last resort: no structured mode (we'll still parse+retry)
+
+    try:
+        resp = await asyncio.wait_for(client.responses.create(**base_kwargs), timeout=timeout_s)
+        return (getattr(resp, "output_text", None) or "").strip()
+    except Exception as e:
+        raise RuntimeError(f"Responses create failed. Last error: {last_err or e}")
+
+
 async def text_output(
     *,
     system: str,
     user: str,
     model: str | None = None,
     max_output_tokens: int = 800,
+    timeout_s: int | None = None,
 ) -> str:
     """
     Like text_json, but returns raw text (never parses JSON). Used as a safe fallback.
     """
     m = model or settings.openai_text_model
-    timeout_s = getattr(settings, "openai_timeout_s", 45)
+    timeout_s = int(timeout_s if timeout_s is not None else getattr(settings, "openai_timeout_s", 45))
     if _has_responses_api():
-        resp = await asyncio.wait_for(
-            client.responses.create(
-                model=m,
-                input=[
-                    {"role": "system", "content": [{"type": "input_text", "text": system}]},
-                    {"role": "user", "content": [{"type": "input_text", "text": user}]},
-                ],
-                max_output_tokens=max_output_tokens,
-            ),
-            timeout=timeout_s,
+        return await _responses_create_text(
+            model=m,
+            system=system,
+            user=user,
+            max_output_tokens=max_output_tokens,
+            timeout_s=timeout_s,
+            enforce_json=False,
         )
-        return (getattr(resp, "output_text", None) or "").strip()
 
     return await _chat_create(
         model=m,
@@ -152,6 +201,7 @@ async def text_output(
         ],
         max_output_tokens=max_output_tokens,
         response_format=None,
+        timeout_s=timeout_s,
     )
 
 
@@ -161,25 +211,22 @@ async def text_json(
     user: str,
     model: str | None = None,
     max_output_tokens: int = 800,
+    timeout_s: int | None = None,
 ) -> dict[str, Any]:
     m = model or settings.openai_text_model
-    timeout_s = getattr(settings, "openai_timeout_s", 45)
+    timeout_s = int(timeout_s if timeout_s is not None else getattr(settings, "openai_timeout_s", 45))
 
     text = ""
     if _has_responses_api():
-        # Prefer Responses API.
-        resp = await asyncio.wait_for(
-            client.responses.create(
-                model=m,
-                input=[
-                    {"role": "system", "content": [{"type": "input_text", "text": system}]},
-                    {"role": "user", "content": [{"type": "input_text", "text": user}]},
-                ],
-                max_output_tokens=max_output_tokens,
-            ),
-            timeout=timeout_s,
+        # Prefer Responses API, but enforce JSON when possible.
+        text = await _responses_create_text(
+            model=m,
+            system=system,
+            user=user,
+            max_output_tokens=max_output_tokens,
+            timeout_s=timeout_s,
+            enforce_json=True,
         )
-        text = (getattr(resp, "output_text", None) or "").strip()
     else:
         # Fallback: Chat Completions API (older SDKs).
         base_messages = [
@@ -192,6 +239,7 @@ async def text_json(
             messages=base_messages,
             max_output_tokens=max_output_tokens,
             response_format={"type": "json_object"},
+            timeout_s=timeout_s,
         )
 
     obj = _try_parse_json(text)
@@ -199,18 +247,14 @@ async def text_json(
         # Retry once with extra strict instruction (works even if response_format isn't supported).
         if _has_responses_api():
             # Retry once with stricter system instruction
-            resp2 = await asyncio.wait_for(
-                client.responses.create(
-                    model=m,
-                    input=[
-                        {"role": "system", "content": [{"type": "input_text", "text": system + _strict_json_suffix()}]},
-                        {"role": "user", "content": [{"type": "input_text", "text": user}]},
-                    ],
-                    max_output_tokens=max_output_tokens,
-                ),
-                timeout=timeout_s,
+            text2 = await _responses_create_text(
+                model=m,
+                system=system + _strict_json_suffix(),
+                user=user,
+                max_output_tokens=max_output_tokens,
+                timeout_s=timeout_s,
+                enforce_json=True,
             )
-            text2 = (getattr(resp2, "output_text", None) or "").strip()
             obj2 = _try_parse_json(text2)
             if obj2 is not None:
                 return obj2
@@ -225,6 +269,7 @@ async def text_json(
                 messages=retry_messages,
                 max_output_tokens=max_output_tokens,
                 response_format=None,
+                timeout_s=timeout_s,
             )
             obj2 = _try_parse_json(text2)
             if obj2 is not None:
