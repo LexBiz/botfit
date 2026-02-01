@@ -492,6 +492,32 @@ async def _send_plans(
     if shopping_lines:
         await _send_html_lines(message, header="🛒 <b>Список покупок (суммарно)</b>:", lines=shopping_lines, reply_markup=main_menu_kb())
 
+    # UX: allow free-text edits right under the plan (no extra buttons)
+    await message.answer(
+        "✍️ Хочешь правки? Напиши текстом прямо сюда.\n"
+        "Примеры:\n"
+        "- «сделай вкуснее и разнообразнее»\n"
+        "- «замени завтрак на что-то без молочки»\n"
+        "- «день 2: перекус сделай за рулём, без крошек»\n"
+        "- «полностью переделай рацион на день»",
+        reply_markup=main_menu_kb(),
+    )
+
+
+def _plan_day_index_from_text(txt: str, *, days: int) -> int:
+    mday = re.search(r"(?:день|day)\s*(\d+)", _norm_text(txt or ""))
+    if mday:
+        try:
+            return max(1, min(int(mday.group(1)), days))
+        except Exception:
+            return 1
+    return 1
+
+
+def _looks_like_full_regen(txt: str) -> bool:
+    t = _norm_text(txt or "")
+    return any(k in t for k in ["полностью", "переделай", "пересобери", "с нуля", "сделай по-другому", "вкуснее", "разнообраз"])
+
 def _active_targets(
     *,
     prefs: dict[str, Any],
@@ -2894,6 +2920,7 @@ async def _generate_plan_for_days(message: Message, *, db: Any, user: Any, days:
                 + "- ВАЖНО: в продуктах и названиях дай 2 языка: русский + чешский.\n"
                 + "- shopping_list обязателен и тоже (русский + чешский).\n"
                 + "- Никаких спорт-добавок (whey/протеин/креатин/гейнер).\n"
+                + "- Рацион должен быть сытный, вкусный, без повторов блюд (по возможности), с овощами/клетчаткой.\n"
             )
 
             # Speed + cost: try fast model first, then fallback to high-quality model.
@@ -3472,6 +3499,129 @@ async def any_text(message: Message) -> None:
             await db.commit()
             await message.answer("⏳ Готовлю рацион… (обычно 10–60 сек) 🍽️", reply_markup=cancel_kb())
             await _generate_plan_for_days(message, db=db, user=user, days=int(n), start_date=start_date)
+            # keep dialog open for free-text edits under the plan
+            await user_repo.set_dialog(user, state="plan_feedback", step=0, data={"start_date": start_date.isoformat(), "days": int(n)})
+            await db.commit()
+            return
+
+        # plan feedback / edits (free-text, no buttons)
+        if user.dialog_state == "plan_feedback":
+            t0 = (message.text or "").strip()
+            if not t0:
+                return
+            if t0 in {BTN_MENU, BTN_CANCEL, "❌ Отмена", "отмена"}:
+                await user_repo.set_dialog(user, state=None, step=None, data=None)
+                await db.commit()
+                await message.answer("Ок.", reply_markup=main_menu_kb())
+                return
+
+            data = loads(user.dialog_data_json) if user.dialog_data_json else {}
+            data = data if isinstance(data, dict) else {}
+            try:
+                start_date = dt.date.fromisoformat(str((data or {}).get("start_date")))
+            except Exception:
+                pref_repo = PreferenceRepo(db)
+                prefs = await pref_repo.get_json(user.id)
+                tz = _tz_from_prefs(prefs)
+                start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date() + dt.timedelta(days=1)
+            days = int((data or {}).get("days") or 1)
+            days = max(1, min(days, 7))
+
+            # pick day to edit
+            day_idx = _plan_day_index_from_text(t0, days=days)
+            edit_date = start_date + dt.timedelta(days=day_idx - 1)
+
+            plan_repo = PlanRepo(db)
+            pref_repo = PreferenceRepo(db)
+            note_repo = CoachNoteRepo(db)
+            prefs = await pref_repo.get_json(user.id)
+
+            current = await plan_repo.get_day_plan_json(user.id, edit_date) or {}
+            active = _active_targets(prefs=prefs, user=user, date_local=edit_date)
+            kcal_target = int(active.get("kcal") or user.calories_target or 0)
+            if kcal_target <= 0:
+                kcal_target = int(user.calories_target or 0)
+
+            # If user asks "fully redo", treat as full regen for that day.
+            instruction = t0
+            if _looks_like_full_regen(t0):
+                instruction = "Полностью переделай рацион на этот день: сделай вкуснее/сытнее/разнообразнее, сохрани цель и режим."
+
+            # routine constraint if present
+            mt = prefs.get("meal_times") if isinstance(prefs.get("meal_times"), list) else None
+            meal_times = [t for t in (mt or []) if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip())][:8]
+            routine_line = ("Используй времена приёмов пищи (строго): " + ", ".join(meal_times) + ".\n") if meal_times else ""
+
+            edit_prompt = (
+                _profile_context(user)
+                + "\nПредпочтения/режим дня (из БД):\n"
+                + dumps(prefs)
+                + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
+                + routine_line
+                + f"\nТекущий план на {edit_date.isoformat()}:\n"
+                + dumps(current)
+                + "\n\nПросьба пользователя:\n"
+                + instruction
+                + "\n\nТребования:\n"
+                + "- Верни строго JSON по схеме.\n"
+                + "- Два языка: русский + чешский в названиях.\n"
+                + "- Сытно/вкусно/разнообразно, без спорт-добавок.\n"
+            )
+
+            last_err: Exception | None = None
+            last_plan: dict[str, Any] | None = None
+            models_to_try: list[str] = []
+            m_fast = str(getattr(settings, "openai_plan_model_fast", "") or "").strip()
+            if m_fast:
+                models_to_try.append(m_fast)
+            models_to_try.append(settings.openai_plan_model)
+            m_fb = str(getattr(settings, "openai_plan_model_fallback", "") or "").strip()
+            if m_fb:
+                models_to_try.append(m_fb)
+
+            for m in [x for x in models_to_try if x]:
+                try:
+                    patched_raw = await text_json(
+                        system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
+                        user=edit_prompt,
+                        model=m,
+                        max_output_tokens=2800,
+                        timeout_s=getattr(settings, "openai_plan_timeout_s", 60),
+                    )
+                except Exception as e:
+                    last_err = e
+                    continue
+                if isinstance(patched_raw, dict):
+                    patched = _normalize_day_plan(patched_raw)
+                    last_plan = patched
+                    break
+
+            if last_plan is None:
+                err = last_err or RuntimeError("Plan edit failed")
+                err_snip = _scrub_secrets(str(err)).strip()
+                err_snip = _escape_html(err_snip[:180]) if err_snip else ""
+                await message.answer(
+                    "⚠️ Не смог переделать рацион. Попробуй переформулировать короче.\n"
+                    f"Тех.деталь: <code>{type(err).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
+                    reply_markup=main_menu_kb(),
+                )
+                return
+
+            # persist updated day
+            await plan_repo.upsert_day_plan(user_id=user.id, date=edit_date, calories_target=kcal_target or None, plan=last_plan)
+            try:
+                await note_repo.add_note(user_id=user.id, kind="plan_edit", title="Правка рациона", note_json={"date": edit_date.isoformat(), "request": t0})
+            except Exception:
+                pass
+            await db.commit()
+
+            # reload all days and show
+            day_plans = await _load_day_plans(plan_repo=plan_repo, user_id=user.id, start_date=start_date, days=days)
+            await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans)
+
+            # keep dialog open for more edits
+            await user_repo.set_dialog(user, state="plan_feedback", step=0, data={"start_date": start_date.isoformat(), "days": days})
+            await db.commit()
             return
 
         # Agent router (free-form commands)
