@@ -1385,6 +1385,78 @@ async def _apply_coach_memory_if_needed(message: Message, *, pref_repo: Preferen
     return True
 
 
+def _pick_meal_from_plan(plan: dict[str, Any], slot: str | None) -> dict[str, Any] | None:
+    meals = plan.get("meals") or []
+    if not isinstance(meals, list) or not meals:
+        return None
+
+    slot = (slot or "").lower().strip()
+    # try by title keywords
+    kw = {
+        "breakfast": ["завтрак"],
+        "lunch": ["обед"],
+        "dinner": ["ужин"],
+        "snack": ["перекус"],
+    }.get(slot, [])
+    if kw:
+        for m in meals:
+            title = str((m or {}).get("title") or "").lower()
+            if any(k in title for k in kw):
+                return m
+
+    # try by time ranges (if present)
+    def _tval(m: dict[str, Any]) -> str:
+        return str(m.get("time") or "").strip()
+
+    def _in_range(t: str, start_h: int, end_h: int) -> bool:
+        if not re.fullmatch(r"\d{2}:\d{2}", t):
+            return False
+        h = int(t[:2])
+        return start_h <= h < end_h
+
+    if slot == "breakfast":
+        for m in meals:
+            if _in_range(_tval(m), 5, 11):
+                return m
+    if slot == "lunch":
+        for m in meals:
+            if _in_range(_tval(m), 11, 16):
+                return m
+    if slot == "dinner":
+        for m in meals:
+            if _in_range(_tval(m), 16, 22):
+                return m
+
+    # fallback: middle meal looks like lunch
+    return meals[min(1, len(meals) - 1)]
+
+
+async def _handle_recall_plan(message: Message, *, plan_repo: PlanRepo, user: Any, slot_hint: str | None) -> bool:
+    today = dt.date.today()
+    plan = await plan_repo.get_day_plan_json(user.id, today)
+    if not plan:
+        await message.answer("Плана на сегодня ещё нет. Сначала сделай 🗓️ Рацион на день.", reply_markup=main_menu_kb())
+        return True
+
+    m = _pick_meal_from_plan(plan, slot_hint)
+    if not m:
+        await message.answer("Не смог найти прием пищи в плане. Можешь сгенерировать план заново: 🗓️ Рацион на день.")
+        return True
+
+    title = str(m.get("title") or "Прием пищи")
+    tm = str(m.get("time") or "").strip()
+    products = m.get("products") or []
+    recipe = m.get("recipe") or []
+
+    text = (
+        f"<b>{'Сегодня' if today else ''} {tm + ' — ' if tm else ''}{title}</b>\n\n"
+        + ("<b>Продукты</b>:\n" + "\n".join([f"- {p.get('name')} — {p.get('grams')} г ({p.get('store')})" for p in products]) + "\n\n" if products else "")
+        + ("<b>Рецепт</b>:\n" + "\n".join([f"- {s}" for s in recipe]) if recipe else "")
+    )
+    await message.answer(text[:3900], reply_markup=main_menu_kb())
+    return True
+
+
 async def _checkin_loop(bot: Bot) -> None:
     """
     Background loop that periodically asks users for photo/measurements according to preferences.
@@ -1888,6 +1960,13 @@ async def any_text(message: Message) -> None:
         if action == "update_prefs":
             pref_repo = PreferenceRepo(db)
             handled = await _apply_coach_memory_if_needed(message, pref_repo=pref_repo, user=user)
+            if handled:
+                await db.commit()
+                return
+        if action == "recall_plan":
+            plan_repo = PlanRepo(db)
+            slot = (route or {}).get("note")
+            handled = await _handle_recall_plan(message, plan_repo=plan_repo, user=user, slot_hint=str(slot) if slot else None)
             if handled:
                 await db.commit()
                 return

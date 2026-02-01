@@ -143,6 +143,15 @@ class PlanRepo:
         await self.db.flush()
         return p
 
+    async def get_day_plan_json(self, user_id: int, date: dt.date) -> dict[str, Any] | None:
+        q: Select[tuple[Plan]] = select(Plan).where(Plan.user_id == user_id).where(Plan.date == date)
+        res = await self.db.execute(q)
+        p = res.scalar_one_or_none()
+        if not p or not p.plan_json:
+            return None
+        obj = loads(p.plan_json)
+        return obj if isinstance(obj, dict) else None
+
 
 class StatRepo:
     def __init__(self, db: AsyncSession):

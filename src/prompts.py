@@ -177,7 +177,7 @@ ROUTER_JSON = """
 
 Формат:
 {
-  "action": "log_meal" | "plan_day" | "analyze_week" | "update_weight" | "show_profile" | "help" | "update_prefs" | "unknown",
+  "action": "log_meal" | "plan_day" | "analyze_week" | "update_weight" | "show_profile" | "help" | "update_prefs" | "recall_plan" | "unknown",
   "meal_text": string | null,
   "weight_kg": number | null,
   "note": string | null
@@ -186,6 +186,7 @@ ROUTER_JSON = """
 Правила:
 - Если сообщение похоже на описание еды/приема пищи/ингредиентов — action="log_meal" и meal_text=исходный текст.
 - Если пользователь просит составить рацион/меню на день — action="plan_day".
+- Если пользователь просит напомнить/показать/повторить рацион или «что у меня на завтрак/обед/ужин сегодня» — action="recall_plan" и note="breakfast|lunch|dinner|snack|today".
 - Если просит анализ дневника за неделю/7 дней — action="analyze_week".
 - Если сообщает новый вес (например "вес 82.5" / "я вешу 82") — action="update_weight" и weight_kg.
 - Если просит показать профиль/данные по мне/мои данные/что ты знаешь про меня — action="show_profile".
