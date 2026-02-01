@@ -791,14 +791,30 @@ async def _start_meal_confirm(
     source: str,
     photo_file_id: str | None = None,
 ) -> None:
+    # Guard: don't enter confirm state on empty/failed parse
+    items0 = draft.get("items") or []
+    totals0 = draft.get("totals") or {}
+    try:
+        tw0 = float(totals0.get("total_weight_g") or 0)
+    except Exception:
+        tw0 = 0.0
+    if not items0 or tw0 <= 0:
+        await user_repo.set_dialog(user, state=None, step=None, data=None)
+        await message.answer(
+            "Не смог распознать еду/рецепт в этом сообщении.\n"
+            "Сформулируй иначе (например: «куриные крылья 4 шт (~300г) + масло 10г») или пришли штрихкод/фото.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
     await user_repo.set_dialog(
         user,
         state="meal_confirm",
         step=1,
         data={"draft": draft, "source": source, "photo_file_id": photo_file_id},
     )
-    items = draft.get("items") or []
-    totals = draft.get("totals") or {}
+    items = items0
+    totals = totals0
     tbl = recipe_table(items)
     per100 = ""
     try:
@@ -1199,11 +1215,28 @@ async def _handle_photo_clarify(
     if user.dialog_state != "photo_clarify":
         return False
 
+    t0 = (message.text or "").strip()
+    if t0 in {
+        "❌ Отмена",
+        BTN_MENU,
+        BTN_HELP,
+        BTN_PROFILE,
+        BTN_WEIGHT,
+        BTN_LOG_MEAL,
+        BTN_PHOTO_HELP,
+        BTN_PLAN,
+        BTN_WEEK,
+        BTN_RECIPE,
+    }:
+        await user_repo.set_dialog(user, state=None, step=None, data=None)
+        await message.answer("Ок, отменил разбор фото.", reply_markup=main_menu_kb())
+        return True
+
     data = loads(user.dialog_data_json) or {}
     questions: list[str] = data.get("questions") or []
     answers: list[str] = data.get("answers") or []
     idx = int(user.dialog_step or 0)
-    text = (message.text or "").strip()
+    text = t0
     answers.append(text)
     idx += 1
 
@@ -1261,7 +1294,24 @@ async def _handle_meal_confirm(message: Message, user_repo: UserRepo, meal_repo:
     source = data.get("source") or "text"
     photo_file_id = data.get("photo_file_id")
 
-    text = _norm_text(message.text or "")
+    raw = (message.text or "").strip()
+    if raw in {
+        "❌ Отмена",
+        BTN_MENU,
+        BTN_HELP,
+        BTN_PROFILE,
+        BTN_WEIGHT,
+        BTN_LOG_MEAL,
+        BTN_PHOTO_HELP,
+        BTN_PLAN,
+        BTN_WEEK,
+        BTN_RECIPE,
+    }:
+        await user_repo.set_dialog(user, state=None, step=None, data=None)
+        await message.answer("Ок, отменил подтверждение.", reply_markup=main_menu_kb())
+        return True
+
+    text = _norm_text(raw)
     if text in {"да", "yes", "y", "ок", "ага"}:
         totals = draft.get("totals") or {}
         await meal_repo.add_meal(
@@ -1280,20 +1330,38 @@ async def _handle_meal_confirm(message: Message, user_repo: UserRepo, meal_repo:
         await message.answer("Ок, не вношу. Можешь прислать уточнение или заново описать прием пищи.")
         return True
 
-    await message.answer("Ответь «да» чтобы сохранить или «нет» чтобы отменить.")
-    return True
+    # Any other message: exit confirm state and let the bot continue normally (coach_chat/router/etc.)
+    await user_repo.set_dialog(user, state=None, step=None, data=None)
+    return False
 
 
 async def _handle_meal_clarify(message: Message, user_repo: UserRepo, food_service: FoodService, user: Any) -> bool:
     if user.dialog_state != "meal_clarify":
         return False
 
+    t0 = (message.text or "").strip()
+    if t0 in {
+        "❌ Отмена",
+        BTN_MENU,
+        BTN_HELP,
+        BTN_PROFILE,
+        BTN_WEIGHT,
+        BTN_LOG_MEAL,
+        BTN_PHOTO_HELP,
+        BTN_PLAN,
+        BTN_WEEK,
+        BTN_RECIPE,
+    }:
+        await user_repo.set_dialog(user, state=None, step=None, data=None)
+        await message.answer("Ок, отменил уточнения по приёму пищи.", reply_markup=main_menu_kb())
+        return True
+
     data = loads(user.dialog_data_json) or {}
     source = data.get("source") or "text"
     qs: list[str] = data.get("questions") or []
     answers: list[str] = data.get("answers") or []
     idx = int(user.dialog_step or 0)
-    answers.append((message.text or "").strip())
+    answers.append(t0)
     idx += 1
 
     if idx < len(qs):
@@ -1333,7 +1401,24 @@ async def _handle_apply_calories(message: Message, user_repo: UserRepo, user: An
         return False
     data = loads(user.dialog_data_json) or {}
     new_cal = data.get("new_calories")
-    text = _norm_text(message.text or "")
+    raw = (message.text or "").strip()
+    if raw in {
+        "❌ Отмена",
+        BTN_MENU,
+        BTN_HELP,
+        BTN_PROFILE,
+        BTN_WEIGHT,
+        BTN_LOG_MEAL,
+        BTN_PHOTO_HELP,
+        BTN_PLAN,
+        BTN_WEEK,
+        BTN_RECIPE,
+    }:
+        await user_repo.set_dialog(user, state=None, step=None, data=None)
+        await message.answer("Ок, не применяю изменения.", reply_markup=main_menu_kb())
+        return True
+
+    text = _norm_text(raw)
     if text in {"да", "yes", "y", "ок", "ага"} and isinstance(new_cal, (int, float)):
         user.calories_target = int(new_cal)
         # пересчитаем макросы от новой калорийности с тем же весом/целью (приближение)
