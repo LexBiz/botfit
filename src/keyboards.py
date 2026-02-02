@@ -37,6 +37,11 @@ BTN_PLAN_APPROVE = "✅ Утвердить рацион"
 BTN_PLAN_REGEN = "🔁 Пересобрать рацион"
 BTN_PLAN_EDIT_CANCEL = "↩️ Закрыть правки"
 
+# New plan feedback controls (optional)
+BTN_PLAN_REGEN_DAY = "🔁 Пересобрать день"
+BTN_PLAN_REGEN_ALL = "🔁 Пересобрать всё"
+BTN_PLAN_FEEDBACK_CLOSE = "✅ Закрыть режим рациона"
+
 
 MAIN_BUTTONS: list[list[str]] = [
     [BTN_PROFILE, BTN_WEIGHT],
@@ -162,5 +167,18 @@ def cancel_kb() -> ReplyKeyboardMarkup:
         keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
         resize_keyboard=True,
         input_field_placeholder="Можно отменить",
+    )
+
+
+def plan_feedback_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_PLAN_REGEN_DAY, BTN_PLAN_REGEN_ALL],
+        [BTN_PLAN_FEEDBACK_CLOSE],
+        [BTN_MENU],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in row] for row in rows],
+        resize_keyboard=True,
+        input_field_placeholder="Напиши правку или выбери действие",
     )
 

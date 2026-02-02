@@ -67,8 +67,12 @@ from src.keyboards import (
     goal_tempo_kb,
     main_menu_kb,
     plan_days_kb,
+    plan_feedback_kb,
     cancel_kb,
     targets_mode_kb,
+    BTN_PLAN_FEEDBACK_CLOSE,
+    BTN_PLAN_REGEN_DAY,
+    BTN_PLAN_REGEN_ALL,
 )
 from src.render import recipe_table
 from src.recipe_calc import compute_totals, parse_ingredients_block
@@ -487,10 +491,10 @@ async def _send_plans(
         message,
         header=f"🍽️ <b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>",
         lines=lines,
-        reply_markup=main_menu_kb(),
+        reply_markup=plan_feedback_kb(),
     )
     if shopping_lines:
-        await _send_html_lines(message, header="🛒 <b>Список покупок (суммарно)</b>:", lines=shopping_lines, reply_markup=main_menu_kb())
+        await _send_html_lines(message, header="🛒 <b>Список покупок (суммарно)</b>:", lines=shopping_lines, reply_markup=plan_feedback_kb())
 
     # UX: allow free-text edits right under the plan (no extra buttons)
     await message.answer(
@@ -500,7 +504,7 @@ async def _send_plans(
         "- «замени завтрак на что-то без молочки»\n"
         "- «день 2: перекус сделай за рулём, без крошек»\n"
         "- «полностью переделай рацион на день»",
-        reply_markup=main_menu_kb(),
+        reply_markup=plan_feedback_kb(),
     )
 
 
@@ -517,6 +521,12 @@ def _plan_day_index_from_text(txt: str, *, days: int) -> int:
 def _looks_like_full_regen(txt: str) -> bool:
     t = _norm_text(txt or "")
     return any(k in t for k in ["полностью", "переделай", "пересобери", "с нуля", "сделай по-другому", "вкуснее", "разнообраз"])
+
+
+def _extract_times(txt: str) -> list[str]:
+    if not txt:
+        return []
+    return re.findall(r"\b\d{2}:\d{2}\b", txt)
 
 
 def _parse_hhmm(t: str) -> tuple[int, int] | None:
@@ -3610,7 +3620,7 @@ async def any_text(message: Message) -> None:
             t0 = (message.text or "").strip()
             if not t0:
                 return
-            if t0 in {BTN_MENU, BTN_CANCEL, "❌ Отмена", "отмена"}:
+            if t0 in {BTN_MENU, BTN_CANCEL, "❌ Отмена", "отмена", BTN_PLAN_FEEDBACK_CLOSE}:
                 await user_repo.set_dialog(user, state=None, step=None, data=None)
                 await db.commit()
                 await message.answer("Ок.", reply_markup=main_menu_kb())
@@ -3632,6 +3642,21 @@ async def any_text(message: Message) -> None:
             day_idx = _plan_day_index_from_text(t0, days=days)
             edit_date = start_date + dt.timedelta(days=day_idx - 1)
 
+            # Optional buttons to regenerate
+            if t0 in {BTN_PLAN_REGEN_ALL}:
+                await message.answer("⏳ Ок, пересобираю рацион…", reply_markup=cancel_kb())
+                await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date)
+                await user_repo.set_dialog(user, state="plan_feedback", step=0, data={"start_date": start_date.isoformat(), "days": days})
+                await db.commit()
+                return
+            if t0 in {BTN_PLAN_REGEN_DAY}:
+                await message.answer(f"⏳ Ок, пересобираю день {day_idx}…", reply_markup=cancel_kb())
+                await _generate_plan_for_days(message, db=db, user=user, days=1, start_date=edit_date)
+                # keep dialog on original range
+                await user_repo.set_dialog(user, state="plan_feedback", step=0, data={"start_date": start_date.isoformat(), "days": days})
+                await db.commit()
+                return
+
             plan_repo = PlanRepo(db)
             pref_repo = PreferenceRepo(db)
             note_repo = CoachNoteRepo(db)
@@ -3648,10 +3673,24 @@ async def any_text(message: Message) -> None:
             if _looks_like_full_regen(t0):
                 instruction = "Полностью переделай рацион на этот день: сделай вкуснее/сытнее/разнообразнее, сохрани цель и режим."
 
-            # routine constraint if present
+            # routine constraint if present (but allow changes if user mentions time/training)
             mt = prefs.get("meal_times") if isinstance(prefs.get("meal_times"), list) else None
-            meal_times = [t for t in (mt or []) if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip())][:8]
-            routine_line = ("Используй времена приёмов пищи (строго): " + ", ".join(meal_times) + ".\n") if meal_times else ""
+            meal_times0 = [t for t in (mt or []) if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip())][:8]
+            meal_times = _complete_meal_times([str(x) for x in meal_times0])
+            mentioned_times = _extract_times(t0)
+            mentions_training = "трен" in _norm_text(t0)
+            routine_line = ""
+            if meal_times and not mentioned_times:
+                routine_line = "Используй времена приёмов пищи (строго): " + ", ".join(meal_times) + ".\n"
+            elif meal_times:
+                routine_line = "Текущий режим (можно менять по просьбе): " + ", ".join(meal_times) + ".\n"
+            training_line = ""
+            if mentions_training and mentioned_times:
+                training_line = "Контекст: тренировка примерно в " + ", ".join(mentioned_times[:2]) + ". Учти pre/post‑workout.\n"
+            focus_line = ""
+            # If user specified a meal time (e.g. 14:30), force edit of that meal
+            if mentioned_times:
+                focus_line = "Фокус: обязательно измени прием пищи на время " + mentioned_times[0] + " (если его нет — создай).\n"
 
             edit_prompt = (
                 _profile_context(user)
@@ -3659,6 +3698,8 @@ async def any_text(message: Message) -> None:
                 + dumps(prefs)
                 + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
                 + routine_line
+                + training_line
+                + focus_line
                 + f"\nТекущий план на {edit_date.isoformat()}:\n"
                 + dumps(current)
                 + "\n\nПросьба пользователя:\n"
@@ -3667,6 +3708,8 @@ async def any_text(message: Message) -> None:
                 + "- Верни строго JSON по схеме.\n"
                 + "- Два языка: русский + чешский в названиях.\n"
                 + "- Сытно/вкусно/разнообразно, без спорт-добавок.\n"
+                + "- Если просьба про время — переставь/добавь приемы пищи по времени.\n"
+                + "- Ты обязан внести изменение (не возвращай исходную версию без правок).\n"
             )
 
             last_err: Exception | None = None
@@ -3697,6 +3740,25 @@ async def any_text(message: Message) -> None:
                     last_plan = patched
                     break
 
+            # If model returned effectively the same plan, retry once with stronger wording.
+            if last_plan is not None:
+                try:
+                    if dumps(last_plan) == dumps(current):
+                        raise RuntimeError("No changes applied by model")
+                except Exception as e:
+                    try:
+                        patched_raw2 = await text_json(
+                            system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
+                            user=edit_prompt + "\n\nЕЩЕ РАЗ: измени минимум 2 блюда или 4 продукта и соблюди цель/времена.",
+                            model=settings.openai_plan_model,
+                            max_output_tokens=2800,
+                            timeout_s=getattr(settings, "openai_plan_timeout_s", 60),
+                        )
+                        if isinstance(patched_raw2, dict):
+                            last_plan = _normalize_day_plan(patched_raw2)
+                    except Exception:
+                        last_err = e
+
             if last_plan is None:
                 err = last_err or RuntimeError("Plan edit failed")
                 err_snip = _scrub_secrets(str(err)).strip()
@@ -3704,7 +3766,7 @@ async def any_text(message: Message) -> None:
                 await message.answer(
                     "⚠️ Не смог переделать рацион. Попробуй переформулировать короче.\n"
                     f"Тех.деталь: <code>{type(err).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
-                    reply_markup=main_menu_kb(),
+                    reply_markup=plan_feedback_kb(),
                 )
                 return
 
