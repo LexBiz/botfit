@@ -2485,7 +2485,10 @@ async def _handle_coach_chat(
         return False
 
     prefs = await pref_repo.get_json(user.id)
-    today_plan = await plan_repo.get_day_plan_json(user.id, dt.date.today())
+    today = dt.date.today()
+    today_plan = await plan_repo.get_day_plan_json(user.id, today)
+    latest_plan_date = await plan_repo.last_plan_date(user.id)
+    latest_plan = await plan_repo.get_day_plan_json(user.id, latest_plan_date) if latest_plan_date else None
     recent_notes = await note_repo.last_notes(user.id, limit=20)
     last_meals = await meal_repo.last_meals(user.id, limit=12)
     meals_json = [
@@ -2531,6 +2534,7 @@ async def _handle_coach_chat(
         "calc_meta": calc_meta,
         "preferences": prefs,
         "today_plan": today_plan,
+        "latest_plan": {"date": latest_plan_date.isoformat(), "plan": latest_plan} if latest_plan_date and latest_plan else None,
         "recent_meals": meals_json,
         "coach_notes": recent_notes,
     }
@@ -2612,6 +2616,45 @@ async def _handle_plan_edit_stateless(message: Message, *, db: Any, user: Any) -
     slot = _detect_meal_slot(txt)
     times = _extract_times(txt)
     mentions_training = "трен" in tnorm
+
+    # If this looks like a question ("что скажешь?", "нормально?", "стоит ли?") — answer as coach,
+    # and only edit plan when user explicitly asks to change it.
+    is_question = ("?" in txt) or any(
+        k in tnorm
+        for k in [
+            "что скаж",
+            "норм",
+            "ок ",
+            "ок?",
+            "подойдет",
+            "подойдёт",
+            "как лучше",
+            "можно ли",
+            "стоит ли",
+            "правильно ли",
+        ]
+    )
+    change_intent = any(
+        k in tnorm
+        for k in [
+            "исправ",
+            "перенес",
+            "перенёс",
+            "передвин",
+            "замени",
+            "замен",
+            "убери",
+            "добавь",
+            "сделай",
+            "поменя",
+            "пересобери",
+            "пересобрать",
+            "с нуля",
+            "полностью",
+        ]
+    )
+    if is_question and not change_intent:
+        return False
 
     # Heuristic: treat as plan edit if user refers to plan/ration OR mentions a meal slot/time/training.
     is_planish = any(k in tnorm for k in ["рацион", "план", "меню", "еда по времени"]) or slot is not None or bool(times) or mentions_training
