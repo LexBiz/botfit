@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import math
 import re
 import traceback
@@ -526,7 +527,109 @@ def _looks_like_full_regen(txt: str) -> bool:
 def _extract_times(txt: str) -> list[str]:
     if not txt:
         return []
-    return re.findall(r"\b\d{2}:\d{2}\b", txt)
+    # Accept both "H:MM" and "HH:MM" and normalize to "HH:MM"
+    out: list[str] = []
+    for h, m in re.findall(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", txt):
+        try:
+            hh = int(h)
+            mm = int(m)
+            out.append(f"{hh:02d}:{mm:02d}")
+        except Exception:
+            continue
+    # keep order, dedupe
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for t in out:
+        if t in seen:
+            continue
+        seen.add(t)
+        uniq.append(t)
+    return uniq
+
+
+def _stable_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _plan_has_time(plan: dict[str, Any] | None, hhmm: str) -> bool:
+    if not plan or not hhmm:
+        return False
+    meals = plan.get("meals") if isinstance(plan, dict) else None
+    if not isinstance(meals, list):
+        return False
+    for m in meals:
+        if isinstance(m, dict) and str(m.get("time") or "").strip() == hhmm:
+            return True
+    return False
+
+
+def _detect_meal_slot(txt: str) -> str | None:
+    t = _norm_text(txt or "")
+    if "завтрак" in t:
+        return "breakfast"
+    if "обед" in t:
+        return "lunch"
+    if "ужин" in t:
+        return "dinner"
+    if any(x in t for x in ["перекус", "снэк", "снек"]):
+        return "snack"
+    return None
+
+
+def _apply_time_to_plan(plan: dict[str, Any], slot: str | None, hhmm: str) -> dict[str, Any]:
+    meals = plan.get("meals")
+    if not isinstance(meals, list) or not hhmm:
+        return plan
+    tgt = _parse_hhmm(hhmm)
+    tgt_min = tgt[0] * 60 + tgt[1] if tgt else None
+    # collect parseable times
+    parsed: list[tuple[int, int]] = []
+    for i, m in enumerate(meals):
+        if not isinstance(m, dict):
+            continue
+        tm = str(m.get("time") or "").strip()
+        ph = _parse_hhmm(tm)
+        if not ph:
+            continue
+        parsed.append((i, ph[0] * 60 + ph[1]))
+    if not parsed:
+        # if no parseable times, just set first meal time
+        if isinstance(meals[0], dict):
+            meals[0]["time"] = hhmm
+        return plan
+
+    def _pick_idx() -> int:
+        if slot == "breakfast":
+            return min(parsed, key=lambda x: x[1])[0]
+        if slot == "dinner":
+            return max(parsed, key=lambda x: x[1])[0]
+        if slot == "lunch":
+            # prefer midday meals, else closest to 13:00
+            midday = [x for x in parsed if 11 * 60 <= x[1] <= 16 * 60]
+            if midday:
+                return min(midday, key=lambda x: abs(x[1] - 13 * 60))[0]
+            return min(parsed, key=lambda x: abs(x[1] - 13 * 60))[0]
+        # snack/default: closest to target time if known
+        if tgt_min is not None:
+            return min(parsed, key=lambda x: abs(x[1] - tgt_min))[0]
+        return min(parsed, key=lambda x: abs(x[1] - 13 * 60))[0]
+
+    idx = _pick_idx()
+    if isinstance(meals[idx], dict):
+        meals[idx]["time"] = hhmm
+
+    def _sort_key(m: Any) -> int:
+        if not isinstance(m, dict):
+            return 10**9
+        tm = str(m.get("time") or "").strip()
+        ph = _parse_hhmm(tm)
+        if not ph:
+            return 10**9
+        return ph[0] * 60 + ph[1]
+
+    meals.sort(key=_sort_key)
+    plan["meals"] = meals
+    return plan
 
 
 def _parse_hhmm(t: str) -> tuple[int, int] | None:
@@ -3679,6 +3782,15 @@ async def any_text(message: Message) -> None:
             meal_times = _complete_meal_times([str(x) for x in meal_times0])
             mentioned_times = _extract_times(t0)
             mentions_training = "трен" in _norm_text(t0)
+            slot = _detect_meal_slot(t0)
+
+            # Deterministic time fix: if user mentions time, apply it in code first
+            current_for_edit = current
+            if mentioned_times:
+                try:
+                    current_for_edit = _apply_time_to_plan(dict(current), slot=slot, hhmm=mentioned_times[0])
+                except Exception:
+                    current_for_edit = current
             routine_line = ""
             if meal_times and not mentioned_times:
                 routine_line = "Используй времена приёмов пищи (строго): " + ", ".join(meal_times) + ".\n"
@@ -3701,7 +3813,7 @@ async def any_text(message: Message) -> None:
                 + training_line
                 + focus_line
                 + f"\nТекущий план на {edit_date.isoformat()}:\n"
-                + dumps(current)
+                + dumps(current_for_edit)
                 + "\n\nПросьба пользователя:\n"
                 + instruction
                 + "\n\nТребования:\n"
@@ -3743,7 +3855,7 @@ async def any_text(message: Message) -> None:
             # If model returned effectively the same plan, retry once with stronger wording.
             if last_plan is not None:
                 try:
-                    if dumps(last_plan) == dumps(current):
+                    if _stable_dumps(last_plan) == _stable_dumps(current_for_edit):
                         raise RuntimeError("No changes applied by model")
                 except Exception as e:
                     try:
@@ -3758,6 +3870,35 @@ async def any_text(message: Message) -> None:
                             last_plan = _normalize_day_plan(patched_raw2)
                     except Exception:
                         last_err = e
+
+            # Hard guarantee: if user mentioned a time, ensure it exists in result (fallback to deterministic shift)
+            if last_plan is not None and mentioned_times:
+                if not _plan_has_time(last_plan, mentioned_times[0]):
+                    try:
+                        last_plan = _apply_time_to_plan(last_plan, slot=slot, hhmm=mentioned_times[0])
+                    except Exception:
+                        pass
+                # still missing → one more focused retry
+                if not _plan_has_time(last_plan, mentioned_times[0]):
+                    try:
+                        patched_raw3 = await text_json(
+                            system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
+                            user=edit_prompt
+                            + f"\n\nКРИТИЧНО: в плане ДОЛЖЕН быть приём пищи ровно в {mentioned_times[0]} (time). Если нет — добавь новый прием.",
+                            model=settings.openai_plan_model,
+                            max_output_tokens=2800,
+                            timeout_s=getattr(settings, "openai_plan_timeout_s", 60),
+                        )
+                        if isinstance(patched_raw3, dict):
+                            last_plan = _normalize_day_plan(patched_raw3)
+                    except Exception:
+                        pass
+                if last_plan is not None and not _plan_has_time(last_plan, mentioned_times[0]):
+                    # final fallback: persist deterministic time shift on current plan
+                    try:
+                        last_plan = _apply_time_to_plan(dict(current_for_edit), slot=slot, hhmm=mentioned_times[0])
+                    except Exception:
+                        last_plan = current_for_edit
 
             if last_plan is None:
                 err = last_err or RuntimeError("Plan edit failed")
