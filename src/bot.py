@@ -416,35 +416,8 @@ async def _send_plans(
     def _norm(s: str) -> str:
         return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-    # aggregate shopping list across days (bilingual)
-    agg: dict[tuple[str, str], float] = {}
-    disp: dict[tuple[str, str], tuple[str, str]] = {}
-    for plan in day_plans:
-        sl = plan.get("shopping_list") or []
-        if not isinstance(sl, list) or not sl:
-            sl = []
-            for m in (plan.get("meals") or []):
-                for p in (m.get("products") or []):
-                    sl.append(p)
-        for it in sl:
-            if not isinstance(it, dict):
-                continue
-            grams = _coerce_number(it.get("grams")) or 0
-            if grams <= 0:
-                continue
-            name_ru = str(it.get("name_ru") or "").strip()
-            name_cz = str(it.get("name_cz") or "").strip()
-            if not (name_ru or name_cz):
-                continue
-            key = (_norm(name_ru), _norm(name_cz))
-            agg[key] = agg.get(key, 0.0) + float(grams)
-            disp.setdefault(key, (name_ru, name_cz))
-
-    shopping_lines: list[str] = []
-    for (kru, kcz), grams in sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:30]:
-        nru, ncz = disp.get((kru, kcz), (kru, kcz))
-        name_txt = (f"<b>{nru}</b>" if nru else f"<b>{ncz}</b>") + (f" / <i>{ncz}</i>" if nru and ncz else "")
-        shopping_lines.append(f"- {name_txt} — {grams:.0f} г")
+    # Intentionally no shopping list + no recipes by default (chat-first UX).
+    # If needed later, we can add "покажи список покупок" as a separate command.
 
     # render plan lines (bilingual)
     days = len(day_plans)
@@ -476,13 +449,6 @@ async def _send_plans(
                     g = _coerce_number(pp.get("grams")) or 0
                     nm = (nru or ncz) + (f" / {ncz}" if nru and ncz else "")
                     lines.append(f"- {nm} — {g:.0f} г")
-            rec = (m or {}).get("recipe_ru") or []
-            if isinstance(rec, list) and rec:
-                lines.append("👨‍🍳 Рецепт:")
-                for s in rec[:12]:
-                    st = str(s or "").strip()
-                    if st:
-                        lines.append(f"- {st}")
             lines.append("")  # spacer
         lines.append(
             f"✅ <b>Итого дня</b>: 🔥 {totals.get('kcal')} ккал | 🥩 {totals.get('protein_g')} | 🧈 {totals.get('fat_g')} | 🍚 {totals.get('carbs_g')}"
@@ -492,21 +458,9 @@ async def _send_plans(
         message,
         header=f"🍽️ <b>Рацион на {days} дн.</b> 📅 Старт: <b>{start_date.isoformat()}</b>",
         lines=lines,
-        reply_markup=plan_feedback_kb(),
+        reply_markup=main_menu_kb(),
     )
-    if shopping_lines:
-        await _send_html_lines(message, header="🛒 <b>Список покупок (суммарно)</b>:", lines=shopping_lines, reply_markup=plan_feedback_kb())
-
-    # UX: allow free-text edits right under the plan (no extra buttons)
-    await message.answer(
-        "✍️ Хочешь правки? Напиши текстом прямо сюда.\n"
-        "Примеры:\n"
-        "- «сделай вкуснее и разнообразнее»\n"
-        "- «замени завтрак на что-то без молочки»\n"
-        "- «день 2: перекус сделай за рулём, без крошек»\n"
-        "- «полностью переделай рацион на день»",
-        reply_markup=plan_feedback_kb(),
-    )
+    await message.answer("Если хочешь правку — просто напиши: например «обед 14:30, тренировка 15:30» или «замени ужин на рыбу».", reply_markup=main_menu_kb())
 
 
 def _plan_day_index_from_text(txt: str, *, days: int) -> int:
@@ -2645,6 +2599,158 @@ async def _handle_recipe_ai(message: Message, *, user_repo: UserRepo, food_servi
     return True
 
 
+async def _handle_plan_edit_stateless(message: Message, *, db: Any, user: Any) -> bool:
+    """
+    Chat-first plan edits: no dialog_state.
+    If user mentions meal slot/time/training, edit the latest available plan (else tomorrow).
+    """
+    txt = (message.text or "").strip()
+    if not txt:
+        return False
+
+    tnorm = _norm_text(txt)
+    slot = _detect_meal_slot(txt)
+    times = _extract_times(txt)
+    mentions_training = "трен" in tnorm
+
+    # Heuristic: treat as plan edit if user refers to plan/ration OR mentions a meal slot/time/training.
+    is_planish = any(k in tnorm for k in ["рацион", "план", "меню", "еда по времени"]) or slot is not None or bool(times) or mentions_training
+    if not is_planish:
+        return False
+
+    pref_repo = PreferenceRepo(db)
+    plan_repo = PlanRepo(db)
+    note_repo = CoachNoteRepo(db)
+    prefs = await pref_repo.get_json(user.id)
+    tz = _tz_from_prefs(prefs)
+    today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
+    tomorrow = today_local + dt.timedelta(days=1)
+
+    last_date = await plan_repo.last_plan_date(user.id)
+    base_date = last_date or tomorrow
+    if base_date < today_local:
+        base_date = tomorrow
+
+    # Optional "day N" relative to base date (best-effort)
+    try:
+        day_idx = _plan_day_index_from_text(txt, days=7)
+    except Exception:
+        day_idx = 1
+    edit_date = base_date + dt.timedelta(days=max(0, day_idx - 1))
+
+    current = await plan_repo.get_day_plan_json(user.id, edit_date)
+    if not current:
+        current = await plan_repo.get_day_plan_json(user.id, tomorrow)
+        if current:
+            edit_date = tomorrow
+    if not current:
+        if any(k in tnorm for k in ["сделай", "собери", "сгенер", "пересобери", "рацион"]):
+            await message.answer("⏳ Ок, соберу рацион на завтра…", reply_markup=cancel_kb())
+            await _generate_plan_for_days(message, db=db, user=user, days=1, start_date=tomorrow)
+            return True
+        return False
+
+    active = _active_targets(prefs=prefs, user=user, date_local=edit_date)
+    kcal_target = int(active.get("kcal") or user.calories_target or 0) or int(user.calories_target or 0)
+
+    current_for_edit = current
+    if times:
+        try:
+            current_for_edit = _apply_time_to_plan(dict(current), slot=slot, hhmm=times[0])
+        except Exception:
+            current_for_edit = current
+
+    mt = prefs.get("meal_times") if isinstance(prefs.get("meal_times"), list) else None
+    meal_times0 = [t for t in (mt or []) if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip())][:8]
+    meal_times = _complete_meal_times([str(x) for x in meal_times0])
+    routine_line = ""
+    if meal_times and not times:
+        routine_line = "Используй времена приёмов пищи (строго): " + ", ".join(meal_times) + ".\n"
+    elif meal_times:
+        routine_line = "Текущий режим (можно менять по просьбе): " + ", ".join(meal_times) + ".\n"
+
+    training_line = ""
+    if mentions_training and times:
+        training_line = "Контекст: тренировка примерно в " + ", ".join(times[:2]) + ". Учти pre/post‑workout.\n"
+
+    focus_line = ""
+    if times:
+        focus_line = "Фокус: обязательно сделай прием пищи на время " + times[0] + " (если его нет — создай).\n"
+
+    edit_prompt = (
+        _profile_context(user)
+        + "\nПредпочтения/режим дня (из БД):\n"
+        + dumps(prefs)
+        + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
+        + routine_line
+        + training_line
+        + focus_line
+        + f"\nТекущий план на {edit_date.isoformat()}:\n"
+        + dumps(current_for_edit)
+        + "\n\nПросьба пользователя:\n"
+        + txt
+        + "\n\nТребования:\n"
+        + "- Верни строго JSON по схеме.\n"
+        + "- Два языка: русский + чешский в названиях.\n"
+        + "- Сытно/вкусно/разнообразно, без спорт-добавок.\n"
+        + "- Ты обязан внести изменение (не возвращай исходную версию без правок).\n"
+    )
+
+    last_plan: dict[str, Any] | None = None
+    last_err: Exception | None = None
+    models_to_try: list[str] = []
+    m_fast = str(getattr(settings, "openai_plan_model_fast", "") or "").strip()
+    if m_fast:
+        models_to_try.append(m_fast)
+    models_to_try.append(settings.openai_plan_model)
+    m_fb = str(getattr(settings, "openai_plan_model_fallback", "") or "").strip()
+    if m_fb:
+        models_to_try.append(m_fb)
+
+    for m in [x for x in models_to_try if x]:
+        try:
+            patched_raw = await text_json(
+                system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
+                user=edit_prompt,
+                model=m,
+                max_output_tokens=2800,
+                timeout_s=getattr(settings, "openai_plan_timeout_s", 60),
+            )
+        except Exception as e:
+            last_err = e
+            continue
+        if isinstance(patched_raw, dict):
+            last_plan = _normalize_day_plan(patched_raw)
+            break
+
+    if last_plan is None:
+        err = last_err or RuntimeError("Plan edit failed")
+        err_snip = _scrub_secrets(str(err)).strip()
+        err_snip = _escape_html(err_snip[:180]) if err_snip else ""
+        await message.answer(
+            "⚠️ Не смог переделать рацион. Попробуй переформулировать короче.\n"
+            f"Тех.деталь: <code>{type(err).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
+            reply_markup=main_menu_kb(),
+        )
+        return True
+
+    if times and not _plan_has_time(last_plan, times[0]):
+        try:
+            last_plan = _apply_time_to_plan(last_plan, slot=slot, hhmm=times[0])
+        except Exception:
+            pass
+
+    await plan_repo.upsert_day_plan(user_id=user.id, date=edit_date, calories_target=kcal_target or None, plan=last_plan)
+    try:
+        await note_repo.add_note(user_id=user.id, kind="plan_edit", title="Правка рациона", note_json={"date": edit_date.isoformat(), "request": txt})
+    except Exception:
+        pass
+    await db.commit()
+
+    await _send_plans(message, db=db, user=user, start_date=edit_date, day_plans=[last_plan])
+    return True
+
+
 async def _handle_daily_checkin(message: Message, *, user_repo: UserRepo, user: Any, db: Any) -> bool:
     if user.dialog_state != "daily_checkin":
         return False
@@ -2982,10 +3088,6 @@ async def _checkin_loop(bot: Bot) -> None:
                                 today_str = now_local.date().isoformat()
                                 if now_local.hour == hh and mm <= now_local.minute <= mm + 2 and last_date != today_str:
                                     try:
-                                        # set dialog state for next user reply
-                                        u.dialog_state = "daily_checkin"
-                                        u.dialog_step = 0
-                                        u.dialog_data_json = dumps({"date": today_str})
                                         await bot.send_message(
                                             u.telegram_id,
                                             "Дневной чек‑лист (ответь одним сообщением):\n"
@@ -3021,23 +3123,22 @@ async def cmd_plan(message: Message) -> None:
             await message.answer("Сначала заполним профиль: /start")
             return
 
-        # New flow: /plan -> choose days (1/3/7). Start date is tomorrow (local tz).
-        days_prefill: int | None = None
+        # Stateless: /plan [1|3|7] -> generate immediately. Start date is tomorrow (local tz).
+        days_req: int | None = None
         if message.text:
             parts = message.text.strip().split()
             if len(parts) >= 2 and parts[1].isdigit():
-                days_prefill = max(1, min(int(parts[1]), 7))
+                days_req = max(1, min(int(parts[1]), 7))
 
         prefs = await pref_repo.get_json(user.id)
         tz = _tz_from_prefs(prefs)
         today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
         start_date = today_local + dt.timedelta(days=1)
-        data: dict[str, Any] = {"start_date": start_date.isoformat()}
-        if days_prefill:
-            data["days_prefill"] = days_prefill
-        await user_repo.set_dialog(user, state="plan_days", step=0, data=data)
+        n = days_req if days_req in {1, 3, 7} else 1
+
         await db.commit()
-        await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b>\nНа сколько дней? (1/3/7)", reply_markup=plan_days_kb())
+        await message.answer("⏳ Готовлю рацион… (обычно 10–60 сек) 🍽️", reply_markup=cancel_kb())
+        await _generate_plan_for_days(message, db=db, user=user, days=int(n), start_date=start_date)
         return
 
 
@@ -3368,9 +3469,10 @@ async def cmd_week(message: Message) -> None:
         await db.commit()
 
         if ca and ca.get("new_calories") is not None:
-            await user_repo.set_dialog(user, state="apply_calories", step=1, data={"new_calories": ca.get("new_calories")})
-            await db.commit()
-            await message.answer("Применить новую норму калорий? (да/нет)")
+            await message.answer(
+                f"Хочешь применить новую норму? Напиши: <code>поставь {int(ca.get('new_calories'))} ккал</code>.",
+                reply_markup=main_menu_kb(),
+            )
 
 
 @router.message()
@@ -3382,7 +3484,6 @@ async def any_text(message: Message) -> None:
         user_repo = UserRepo(db)
         meal_repo = MealRepo(db)
         food_repo = FoodRepo(db)
-        food_service = FoodService(food_repo)
         user = await user_repo.get_or_create(message.from_user.id, message.from_user.username)
 
         # If a long-running plan is being generated, keep UX tight.
@@ -3410,70 +3511,16 @@ async def any_text(message: Message) -> None:
             await message.answer("⏳ Я собираю рацион прямо сейчас…\n\nПодожди 10–40 сек или нажми ❌ Отмена.", reply_markup=cancel_kb())
             return
 
-        handled = await _handle_targets_mode(message, user_repo=user_repo, user=user, db=db)
-        if handled:
-            await db.commit()
-            return
-
-        handled = await _handle_daily_checkin(message, user_repo=user_repo, user=user, db=db)
-        if handled:
-            await db.commit()
-            return
-
-        handled = await _handle_coach_onboarding(message, user_repo, user)
-        if handled:
-            await db.commit()
-            return
-
-        handled = await _handle_onboarding_step(message, user_repo, user)
-        if handled:
-            await db.commit()
-            return
-
-        picked = await _handle_food_pick(message, user_repo=user_repo, food_service=food_service, user=user)
-        if picked and picked.get("handled") and picked.get("draft"):
-            await _start_meal_confirm(
-                message,
-                user_repo,
-                user,
-                picked["draft"],
-                source=picked.get("source") or "text",
-                photo_file_id=picked.get("photo_file_id"),
-            )
-            await db.commit()
-            return
-        if picked and picked.get("handled"):
-            await db.commit()
-            return
-
-        handled = await _handle_photo_clarify(
-            message,
-            bot=message.bot,
-            user_repo=user_repo,
-            meal_repo=meal_repo,
-            food_service=food_service,
-            user=user,
-        )
-        if handled:
-            await db.commit()
-            return
-
-        handled = await _handle_meal_clarify(message, user_repo=user_repo, food_service=food_service, user=user)
-        if handled:
-            await db.commit()
-            return
-
-        handled = await _handle_meal_confirm(message, user_repo=user_repo, meal_repo=meal_repo, user=user)
-        if handled:
-            await db.commit()
-            return
-
-        handled = await _handle_apply_calories(message, user_repo=user_repo, user=user)
-        if handled:
-            await db.commit()
-            return
-
+        # Onboarding only while profile is incomplete (one-time).
         if not user.profile_complete:
+            handled = await _handle_coach_onboarding(message, user_repo, user)
+            if handled:
+                await db.commit()
+                return
+            handled = await _handle_onboarding_step(message, user_repo, user)
+            if handled:
+                await db.commit()
+                return
             await message.answer("Сначала заполним профиль: напиши /start")
             return
 
@@ -3494,442 +3541,47 @@ async def any_text(message: Message) -> None:
             tz = _tz_from_prefs(prefs)
             today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
             start_date = today_local + dt.timedelta(days=1)
-            await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat()})
             await db.commit()
-            await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b>\nНа сколько дней? (1/3/7)", reply_markup=plan_days_kb())
+            await message.answer("⏳ Готовлю рацион… (обычно 10–60 сек) 🍽️", reply_markup=cancel_kb())
+            await _generate_plan_for_days(message, db=db, user=user, days=1, start_date=start_date)
             return
         if t in {BTN_WEEK}:
             await cmd_week(message)
             return
         if t in {BTN_REMINDERS}:
-            await user_repo.set_dialog(user, state="reminders_setup", step=0, data=None)
-            await db.commit()
             await message.answer(
-                "Ок. Опиши напоминания одним сообщением.\n"
+                "Опиши напоминания одним сообщением — я сохраню.\n"
                 "Примеры:\n"
                 "- «каждый день в 06:00 спроси вес»\n"
                 "- «в 09:00 по будням перекус»\n"
                 "- «в 21:30 спроси, как прошёл день и соблюдал ли калории»\n"
                 "- «каждые 3 дня попроси фото и замеры»\n\n"
-                "Чтобы отменить — напиши: ❌ Отмена",
+                "Чтобы отключить/изменить — просто напиши новое правило.",
                 reply_markup=main_menu_kb(),
             )
             return
         if t in {BTN_PROGRESS}:
-            await user_repo.set_dialog(user, state="progress_mode", step=0, data=None)
-            await db.commit()
             await message.answer(
-                "Ок, режим прогресса.\n"
-                "- Пришли замеры текстом (пример: «талия 102, грудь 112, бедра 108»)\n"
-                "- Или пришли фото прогресса (можно написать в подписи «прогресс»)\n"
-                "- Напиши «сравни» — сравню последние записи/фото.\n\n"
-                "Чтобы отменить — напиши: ❌ Отмена",
+                "Пришли замеры текстом (пример: «талия 102, грудь 112, бедра 108»)\n"
+                "или фото прогресса с подписью «прогресс».",
                 reply_markup=main_menu_kb(),
             )
             return
         if t in {BTN_WEIGHT}:
-            await user_repo.set_dialog(user, state="set_weight", step=0, data=None)
-            await db.commit()
             await message.answer("Напиши новый вес в кг (например: 82.5).", reply_markup=main_menu_kb())
             return
         if t in {BTN_PHOTO_HELP}:
             await message.answer("Ок. Просто отправь фото блюда сюда — я разберу и посчитаю.", reply_markup=main_menu_kb())
             return
         if t in {BTN_LOG_MEAL}:
-            await message.answer("Ок. Напиши прием пищи (например: «гречка 200г, курица 150г, масло 10г»).", reply_markup=main_menu_kb())
-            return
-
-        # reminders setup dialog
-        if user.dialog_state == "reminders_setup":
-            if t in {"❌ Отмена"}:
-                await user_repo.set_dialog(user, state=None, step=None, data=None)
-                await db.commit()
-                await message.answer("Ок, отменил.", reply_markup=main_menu_kb())
-                return
-            # reuse coach memory extractor; it already stores to preferences + coach_notes
-            pref_repo = PreferenceRepo(db)
-            handled = await _apply_coach_memory_if_needed(message, pref_repo=pref_repo, user=user)
-            await user_repo.set_dialog(user, state=None, step=None, data=None)
-            await db.commit()
-            if not handled:
-                await message.answer("Не понял напоминания. Напиши проще (время + что спрашивать).", reply_markup=main_menu_kb())
-            return
-
-        # progress mode dialog (text only; photos handled in photo handler)
-        if user.dialog_state == "progress_mode":
-            if t in {"❌ Отмена"}:
-                await user_repo.set_dialog(user, state=None, step=None, data=None)
-                await db.commit()
-                await message.answer("Ок, вышел из режима прогресса.", reply_markup=main_menu_kb())
-                return
-            # "compare" request
-            if any(x in _norm_text(t) for x in ["сравни", "анализ", "прогресс"]):
-                note_repo = CoachNoteRepo(db)
-                pref_repo = PreferenceRepo(db)
-                plan_repo = PlanRepo(db)
-                handled = await _handle_coach_chat(
-                    message,
-                    pref_repo=pref_repo,
-                    meal_repo=meal_repo,
-                    plan_repo=plan_repo,
-                    note_repo=note_repo,
-                    user=user,
-                )
-                await db.commit()
-                return
-            # store measurements as durable note
-            try:
-                note_repo = CoachNoteRepo(db)
-                await note_repo.add_note(user_id=user.id, kind="measurements", title="Замеры", note_text=t)
-                await db.commit()
-                await message.answer("Сохранил замеры. Напиши «сравни», чтобы я оценил динамику.", reply_markup=main_menu_kb())
-            except Exception:
-                await message.answer("Не смог сохранить замеры. Попробуй ещё раз.", reply_markup=main_menu_kb())
-            return
-
-        # set_weight dialog
-        if user.dialog_state == "set_weight":
-            w = _parse_float(t)
-            if w is None:
-                await message.answer("Вес числом (пример: 82.5).", reply_markup=main_menu_kb())
-                return
-            user.weight_kg = float(w)
-            # persist daily weight log (local date by timezone)
-            try:
-                pref_repo = PreferenceRepo(db)
-                prefs = await pref_repo.get_json(user.id)
-                tz = _tz_from_prefs(prefs)
-                today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
-                wrepo = WeightLogRepo(db)
-                await wrepo.upsert(user_id=user.id, date=today_local, weight_kg=float(w))
-            except Exception:
-                pass
-            # recompute meta always, but do not overwrite custom targets
-            pref_repo = PreferenceRepo(db)
-            prefs = await pref_repo.get_json(user.id)
-            deficit_pct = prefs.get("deficit_pct")
-            tr, meta = compute_targets_with_meta(
-                sex=user.sex,  # type: ignore[arg-type]
-                age=user.age,
-                height_cm=user.height_cm,
-                weight_kg=user.weight_kg,
-                activity=user.activity_level,  # type: ignore[arg-type]
-                goal=user.goal,  # type: ignore[arg-type]
-                deficit_pct=float(deficit_pct) if deficit_pct is not None else None,
-            )
-            targets_source = str(prefs.get("targets_source") or "coach").strip().lower()
-            if targets_source != "custom":
-                user.calories_target = tr.calories
-                user.protein_g_target = tr.protein_g
-                user.fat_g_target = tr.fat_g
-                user.carbs_g_target = tr.carbs_g
-                await pref_repo.merge(
-                    user.id,
-                    {"targets_source": "coach", "targets": {"calories": tr.calories, "protein_g": tr.protein_g, "fat_g": tr.fat_g, "carbs_g": tr.carbs_g}},
-                )
-            else:
-                tz = _tz_from_prefs(prefs)
-                today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
-                active = _active_targets(prefs=prefs, user=user, date_local=today_local)
-                if active.get("kcal") is not None:
-                    user.calories_target = int(active["kcal"])
-                if active.get("protein_g") is not None:
-                    user.protein_g_target = int(active["protein_g"])
-                if active.get("fat_g") is not None:
-                    user.fat_g_target = int(active["fat_g"])
-                if active.get("carbs_g") is not None:
-                    user.carbs_g_target = int(active["carbs_g"])
-
-            await pref_repo.merge(user.id, {"bmr_kcal": meta.bmr_kcal, "tdee_kcal": meta.tdee_kcal, "deficit_pct": meta.deficit_pct})
-            await user_repo.set_dialog(user, state=None, step=None, data=None)
-            try:
-                note_repo = CoachNoteRepo(db)
-                await note_repo.add_note(
-                    user_id=user.id,
-                    kind="weight_update",
-                    title="Обновление веса",
-                    note_json={"weight_kg": float(w), "calories_target": user.calories_target, "macros": {"p": user.protein_g_target, "f": user.fat_g_target, "c": user.carbs_g_target}},
-                )
-            except Exception:
-                pass
-            await db.commit()
-            await message.answer(
-                f"⚖️ Вес обновил: <b>{w} кг</b> ✅\n"
-                f"🎯 Текущая цель: <b>{user.calories_target} ккал</b>\n"
-                f"🥩🧈🍚 БЖУ: <b>{user.protein_g_target}/{user.fat_g_target}/{user.carbs_g_target} г</b>",
-                reply_markup=main_menu_kb(),
-            )
-            return
-
-        # plan dialog (days only)
-        if user.dialog_state == "plan_days":
-            if t in {BTN_CANCEL, "❌ Отмена", BTN_MENU}:
-                await user_repo.set_dialog(user, state=None, step=None, data=None)
-                await db.commit()
-                await message.answer("Ок, отменил.", reply_markup=main_menu_kb())
-                return
-
-            pref_repo = PreferenceRepo(db)
-            prefs = await pref_repo.get_json(user.id)
-            tz = _tz_from_prefs(prefs)
-            today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
-
-            n = _parse_int(t)
-            if n is None:
-                try:
-                    data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-                    dp = (data or {}).get("days_prefill")
-                    if isinstance(dp, int) and 1 <= dp <= 7:
-                        n = dp
-                except Exception:
-                    n = None
-            if n is None:
-                # accept common buttons
-                if t == BTN_DAYS_1:
-                    n = 1
-                elif t == BTN_DAYS_3:
-                    n = 3
-                elif t == BTN_DAYS_7:
-                    n = 7
-            if n is None or n not in {1, 3, 7}:
-                await message.answer("Выбери 1 / 3 / 7 дней кнопкой 👇", reply_markup=plan_days_kb())
-                return
-
-            start_date = today_local + dt.timedelta(days=1)
-            try:
-                data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-                sd = (data or {}).get("start_date")
-                if isinstance(sd, str):
-                    start_date = dt.date.fromisoformat(sd)
-            except Exception:
-                pass
-
-            await user_repo.set_dialog(
-                user,
-                state="plan_generating",
-                step=0,
-                data={"start_date": start_date.isoformat(), "days": int(n), "started_at_utc": dt.datetime.now(dt.timezone.utc).isoformat()},
-            )
-            await db.commit()
-            await message.answer("⏳ Готовлю рацион… (обычно 10–60 сек) 🍽️", reply_markup=cancel_kb())
-            await _generate_plan_for_days(message, db=db, user=user, days=int(n), start_date=start_date)
-            # keep dialog open for free-text edits under the plan
-            await user_repo.set_dialog(user, state="plan_feedback", step=0, data={"start_date": start_date.isoformat(), "days": int(n)})
-            await db.commit()
-            return
-
-        # plan feedback / edits (free-text, no buttons)
-        if user.dialog_state == "plan_feedback":
-            t0 = (message.text or "").strip()
-            if not t0:
-                return
-            if t0 in {BTN_MENU, BTN_CANCEL, "❌ Отмена", "отмена", BTN_PLAN_FEEDBACK_CLOSE}:
-                await user_repo.set_dialog(user, state=None, step=None, data=None)
-                await db.commit()
-                await message.answer("Ок.", reply_markup=main_menu_kb())
-                return
-
-            data = loads(user.dialog_data_json) if user.dialog_data_json else {}
-            data = data if isinstance(data, dict) else {}
-            try:
-                start_date = dt.date.fromisoformat(str((data or {}).get("start_date")))
-            except Exception:
-                pref_repo = PreferenceRepo(db)
-                prefs = await pref_repo.get_json(user.id)
-                tz = _tz_from_prefs(prefs)
-                start_date = dt.datetime.now(dt.timezone.utc).astimezone(tz).date() + dt.timedelta(days=1)
-            days = int((data or {}).get("days") or 1)
-            days = max(1, min(days, 7))
-
-            # pick day to edit
-            day_idx = _plan_day_index_from_text(t0, days=days)
-            edit_date = start_date + dt.timedelta(days=day_idx - 1)
-
-            # Optional buttons to regenerate
-            if t0 in {BTN_PLAN_REGEN_ALL}:
-                await message.answer("⏳ Ок, пересобираю рацион…", reply_markup=cancel_kb())
-                await _generate_plan_for_days(message, db=db, user=user, days=days, start_date=start_date)
-                await user_repo.set_dialog(user, state="plan_feedback", step=0, data={"start_date": start_date.isoformat(), "days": days})
-                await db.commit()
-                return
-            if t0 in {BTN_PLAN_REGEN_DAY}:
-                await message.answer(f"⏳ Ок, пересобираю день {day_idx}…", reply_markup=cancel_kb())
-                await _generate_plan_for_days(message, db=db, user=user, days=1, start_date=edit_date)
-                # keep dialog on original range
-                await user_repo.set_dialog(user, state="plan_feedback", step=0, data={"start_date": start_date.isoformat(), "days": days})
-                await db.commit()
-                return
-
-            plan_repo = PlanRepo(db)
-            pref_repo = PreferenceRepo(db)
-            note_repo = CoachNoteRepo(db)
-            prefs = await pref_repo.get_json(user.id)
-
-            current = await plan_repo.get_day_plan_json(user.id, edit_date) or {}
-            active = _active_targets(prefs=prefs, user=user, date_local=edit_date)
-            kcal_target = int(active.get("kcal") or user.calories_target or 0)
-            if kcal_target <= 0:
-                kcal_target = int(user.calories_target or 0)
-
-            # If user asks "fully redo", treat as full regen for that day.
-            instruction = t0
-            if _looks_like_full_regen(t0):
-                instruction = "Полностью переделай рацион на этот день: сделай вкуснее/сытнее/разнообразнее, сохрани цель и режим."
-
-            # routine constraint if present (but allow changes if user mentions time/training)
-            mt = prefs.get("meal_times") if isinstance(prefs.get("meal_times"), list) else None
-            meal_times0 = [t for t in (mt or []) if isinstance(t, str) and re.fullmatch(r"\d{2}:\d{2}", t.strip())][:8]
-            meal_times = _complete_meal_times([str(x) for x in meal_times0])
-            mentioned_times = _extract_times(t0)
-            mentions_training = "трен" in _norm_text(t0)
-            slot = _detect_meal_slot(t0)
-
-            # Deterministic time fix: if user mentions time, apply it in code first
-            current_for_edit = current
-            if mentioned_times:
-                try:
-                    current_for_edit = _apply_time_to_plan(dict(current), slot=slot, hhmm=mentioned_times[0])
-                except Exception:
-                    current_for_edit = current
-            routine_line = ""
-            if meal_times and not mentioned_times:
-                routine_line = "Используй времена приёмов пищи (строго): " + ", ".join(meal_times) + ".\n"
-            elif meal_times:
-                routine_line = "Текущий режим (можно менять по просьбе): " + ", ".join(meal_times) + ".\n"
-            training_line = ""
-            if mentions_training and mentioned_times:
-                training_line = "Контекст: тренировка примерно в " + ", ".join(mentioned_times[:2]) + ". Учти pre/post‑workout.\n"
-            focus_line = ""
-            # If user specified a meal time (e.g. 14:30), force edit of that meal
-            if mentioned_times:
-                focus_line = "Фокус: обязательно измени прием пищи на время " + mentioned_times[0] + " (если его нет — создай).\n"
-
-            edit_prompt = (
-                _profile_context(user)
-                + "\nПредпочтения/режим дня (из БД):\n"
-                + dumps(prefs)
-                + f"\nЦель: {kcal_target} ккал. БЖУ: {active.get('protein_g')}/{active.get('fat_g')}/{active.get('carbs_g')}.\n"
-                + routine_line
-                + training_line
-                + focus_line
-                + f"\nТекущий план на {edit_date.isoformat()}:\n"
-                + dumps(current_for_edit)
-                + "\n\nПросьба пользователя:\n"
-                + instruction
-                + "\n\nТребования:\n"
-                + "- Верни строго JSON по схеме.\n"
-                + "- Два языка: русский + чешский в названиях.\n"
-                + "- Сытно/вкусно/разнообразно, без спорт-добавок.\n"
-                + "- Если просьба про время — переставь/добавь приемы пищи по времени.\n"
-                + "- Ты обязан внести изменение (не возвращай исходную версию без правок).\n"
-            )
-
-            last_err: Exception | None = None
-            last_plan: dict[str, Any] | None = None
-            models_to_try: list[str] = []
-            m_fast = str(getattr(settings, "openai_plan_model_fast", "") or "").strip()
-            if m_fast:
-                models_to_try.append(m_fast)
-            models_to_try.append(settings.openai_plan_model)
-            m_fb = str(getattr(settings, "openai_plan_model_fallback", "") or "").strip()
-            if m_fb:
-                models_to_try.append(m_fb)
-
-            for m in [x for x in models_to_try if x]:
-                try:
-                    patched_raw = await text_json(
-                        system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
-                        user=edit_prompt,
-                        model=m,
-                        max_output_tokens=2800,
-                        timeout_s=getattr(settings, "openai_plan_timeout_s", 60),
-                    )
-                except Exception as e:
-                    last_err = e
-                    continue
-                if isinstance(patched_raw, dict):
-                    patched = _normalize_day_plan(patched_raw)
-                    last_plan = patched
-                    break
-
-            # If model returned effectively the same plan, retry once with stronger wording.
-            if last_plan is not None:
-                try:
-                    if _stable_dumps(last_plan) == _stable_dumps(current_for_edit):
-                        raise RuntimeError("No changes applied by model")
-                except Exception as e:
-                    try:
-                        patched_raw2 = await text_json(
-                            system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
-                            user=edit_prompt + "\n\nЕЩЕ РАЗ: измени минимум 2 блюда или 4 продукта и соблюди цель/времена.",
-                            model=settings.openai_plan_model,
-                            max_output_tokens=2800,
-                            timeout_s=getattr(settings, "openai_plan_timeout_s", 60),
-                        )
-                        if isinstance(patched_raw2, dict):
-                            last_plan = _normalize_day_plan(patched_raw2)
-                    except Exception:
-                        last_err = e
-
-            # Hard guarantee: if user mentioned a time, ensure it exists in result (fallback to deterministic shift)
-            if last_plan is not None and mentioned_times:
-                if not _plan_has_time(last_plan, mentioned_times[0]):
-                    try:
-                        last_plan = _apply_time_to_plan(last_plan, slot=slot, hhmm=mentioned_times[0])
-                    except Exception:
-                        pass
-                # still missing → one more focused retry
-                if not _plan_has_time(last_plan, mentioned_times[0]):
-                    try:
-                        patched_raw3 = await text_json(
-                            system=f"{SYSTEM_COACH}\n\n{DAY_PLAN_JSON}",
-                            user=edit_prompt
-                            + f"\n\nКРИТИЧНО: в плане ДОЛЖЕН быть приём пищи ровно в {mentioned_times[0]} (time). Если нет — добавь новый прием.",
-                            model=settings.openai_plan_model,
-                            max_output_tokens=2800,
-                            timeout_s=getattr(settings, "openai_plan_timeout_s", 60),
-                        )
-                        if isinstance(patched_raw3, dict):
-                            last_plan = _normalize_day_plan(patched_raw3)
-                    except Exception:
-                        pass
-                if last_plan is not None and not _plan_has_time(last_plan, mentioned_times[0]):
-                    # final fallback: persist deterministic time shift on current plan
-                    try:
-                        last_plan = _apply_time_to_plan(dict(current_for_edit), slot=slot, hhmm=mentioned_times[0])
-                    except Exception:
-                        last_plan = current_for_edit
-
-            if last_plan is None:
-                err = last_err or RuntimeError("Plan edit failed")
-                err_snip = _scrub_secrets(str(err)).strip()
-                err_snip = _escape_html(err_snip[:180]) if err_snip else ""
-                await message.answer(
-                    "⚠️ Не смог переделать рацион. Попробуй переформулировать короче.\n"
-                    f"Тех.деталь: <code>{type(err).__name__}</code>" + (f"\n<code>{err_snip}</code>" if err_snip else ""),
-                    reply_markup=plan_feedback_kb(),
-                )
-                return
-
-            # persist updated day
-            await plan_repo.upsert_day_plan(user_id=user.id, date=edit_date, calories_target=kcal_target or None, plan=last_plan)
-            try:
-                await note_repo.add_note(user_id=user.id, kind="plan_edit", title="Правка рациона", note_json={"date": edit_date.isoformat(), "request": t0})
-            except Exception:
-                pass
-            await db.commit()
-
-            # reload all days and show
-            day_plans = await _load_day_plans(plan_repo=plan_repo, user_id=user.id, start_date=start_date, days=days)
-            await _send_plans(message, db=db, user=user, start_date=start_date, day_plans=day_plans)
-
-            # keep dialog open for more edits
-            await user_repo.set_dialog(user, state="plan_feedback", step=0, data={"start_date": start_date.isoformat(), "days": days})
-            await db.commit()
+            await message.answer("Напиши прием пищи одним сообщением, начиная с <code>еда:</code> (пример: «еда: гречка 200г, курица 150г, масло 10г»).", reply_markup=main_menu_kb())
             return
 
         # Agent router (free-form commands)
         user_text = (message.text or "").strip()
+        # Chat-first: attempt plan edit without any dialog state
+        if await _handle_plan_edit_stateless(message, db=db, user=user):
+            return
         route = await _agent_route(user_text, user=user)
         action = (route or {}).get("action")
 
@@ -4021,20 +3673,7 @@ async def any_text(message: Message) -> None:
             )
             return
         if action == "plan_day":
-            async with SessionLocal() as db:
-                user_repo = UserRepo(db)
-                pref_repo = PreferenceRepo(db)
-                user = await user_repo.get_or_create(message.from_user.id, message.from_user.username if message.from_user else None)
-                if not user.profile_complete:
-                    await message.answer("Сначала заполним профиль: /start")
-                    return
-                prefs = await pref_repo.get_json(user.id)
-                tz = _tz_from_prefs(prefs)
-                today_local = dt.datetime.now(dt.timezone.utc).astimezone(tz).date()
-                start_date = today_local + dt.timedelta(days=1)
-                await user_repo.set_dialog(user, state="plan_days", step=0, data={"start_date": start_date.isoformat()})
-                await db.commit()
-            await message.answer(f"📆 Старт: <b>{start_date.isoformat()}</b>\nНа сколько дней? (1/3/7)", reply_markup=plan_days_kb())
+            await cmd_plan(message)
             return
         if action == "analyze_week":
             await cmd_week(message)
@@ -4060,74 +3699,19 @@ async def any_text(message: Message) -> None:
             if handled:
                 await db.commit()
                 return
-        if action == "recipe_ai":
-            handled = await _handle_recipe_ai(message, user_repo=user_repo, food_service=food_service, user=user, text=(route or {}).get("meal_text") or user_text)
-            if handled:
-                await db.commit()
-                return
         if action == "unknown":
             note = (route or {}).get("note") or "Уточни, что именно сделать?"
             await message.answer(str(note))
             return
 
-        # Default fallback: if it doesn't look like a meal, answer as coach
-        if not _looks_like_meal(user_text):
-            pref_repo = PreferenceRepo(db)
-            plan_repo = PlanRepo(db)
-            note_repo = CoachNoteRepo(db)
-            handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, note_repo=note_repo, user=user)
-            if handled:
-                await db.commit()
-                return
-
-        # Otherwise: treat as meal
-        meal_text = (route or {}).get("meal_text") or user_text
-
-        # Text -> items (GPT) -> macros (OpenFoodFacts)
-        try:
-            parsed = await text_json(
-                system=f"{SYSTEM_NUTRITIONIST}\n\n{MEAL_ITEMS_JSON}",
-                user=_profile_context(user) + "\nВыдели продукты и граммовки:\n" + meal_text,
-                max_output_tokens=650,
-            )
-        except Exception as e:
-            await message.answer(f"Не смог разобрать сообщение (ошибка): {e}\nПопробуй написать проще (например: «гречка 200г, курица 150г»).")
-            return
-
-        if parsed.get("needs_clarification"):
-            qs = parsed.get("clarifying_questions") or []
-            if qs:
-                await user_repo.set_dialog(
-                    user,
-                    state="meal_clarify",
-                    step=0,
-                    data={"draft": parsed, "questions": qs, "answers": [], "source": "text"},
-                )
-                await db.commit()
-                await message.answer(qs[0])
-                return
-        else:
-            extra_qs = _needs_hidden_calorie_clarification(meal_text)
-            if extra_qs:
-                await user_repo.set_dialog(
-                    user,
-                    state="meal_clarify",
-                    step=0,
-                    data={"draft": parsed, "questions": extra_qs, "answers": [], "source": "text"},
-                )
-                await db.commit()
-                await message.answer(extra_qs[0])
-                return
-
-        draft2, unresolved_ctx = await _build_meal_from_items(items=parsed.get("items") or [], food_service=food_service)
-        if unresolved_ctx:
-            await user_repo.set_dialog(user, state="food_pick", step=0, data={"ctx": unresolved_ctx, "source": "text"})
+        # Default: always answer as coach (ChatGPT-like).
+        pref_repo = PreferenceRepo(db)
+        plan_repo = PlanRepo(db)
+        note_repo = CoachNoteRepo(db)
+        handled = await _handle_coach_chat(message, pref_repo=pref_repo, meal_repo=meal_repo, plan_repo=plan_repo, note_repo=note_repo, user=user)
+        if handled:
             await db.commit()
-            await message.answer(_format_food_pick_question(unresolved_ctx, 0))
             return
-
-        await _start_meal_confirm(message, user_repo, user, draft2 or {}, source="text")
-        await db.commit()
 
 
 async def main() -> None:

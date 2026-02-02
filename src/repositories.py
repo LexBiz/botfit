@@ -152,6 +152,12 @@ class PlanRepo:
         obj = loads(p.plan_json)
         return obj if isinstance(obj, dict) else None
 
+    async def last_plan_date(self, user_id: int) -> dt.date | None:
+        q: Select[tuple[Plan]] = select(Plan).where(Plan.user_id == user_id).order_by(Plan.date.desc()).limit(1)
+        res = await self.db.execute(q)
+        p = res.scalar_one_or_none()
+        return p.date if p else None
+
 
 class CoachNoteRepo:
     def __init__(self, db: AsyncSession):
